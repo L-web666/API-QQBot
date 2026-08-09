@@ -1,0 +1,11 @@
+# QQ机器人相关
+websocket-client==1.7.0
+requests==2.31.0
+
+# AI服务相关（OpenAI格式兼容）
+openai==1.12.0
+
+# 其他工具
+python-dotenv==1.0.1
+
+# 如需安装这些依赖，请在终端中输入：pip install -r requirements.txt 或 py -m pip install -r requirements.txt
