@@ -1,5 +1,5 @@
 """
-QQ机器人连接模块 - 负责WebSocket连接、消息收发
+QQ机器人连接模块 - 负责WebSocket连接、消息收发、会话恢复
 """
 
 import json
@@ -8,31 +8,40 @@ import threading
 import requests
 import websocket
 from typing import Optional, Dict, Any, Callable
-from urllib.parse import urlparse
 
 
 class QQClient:
-    """QQ机器人客户端"""
+    """QQ机器人客户端，支持自动重连和会话恢复（RESUME）"""
     
     API_BASE = "https://api.bot.qq.com"
     WSS_GATEWAY = "wss://api.bot.qq.com/websocket"
     
-    def __init__(self, app_id: str, app_secret: str, sandbox: bool = False, reconnect_attempts: int = 5, reconnect_interval: int = 10, logger=None):
+    def __init__(self, app_id: str, app_secret: str, sandbox: bool = False,
+                 reconnect_attempts: int = 5, reconnect_interval: int = 10,
+                 logger=None):
         self.app_id = app_id
         self.app_secret = app_secret
         self.sandbox = sandbox
         self.logger = logger
+        
+        # 连接参数
+        self.reconnect_attempts = reconnect_attempts
+        self.reconnect_interval = reconnect_interval
+        self.should_reconnect = True
+        
+        # 会话状态（用于 RESUME）
+        self.session_id = None          # 会话ID，由 READY 事件提供
+        self.last_seq = 0               # 最后收到的消息序列号
+        self._should_resume = False     # 是否尝试恢复会话
+        
+        # WebSocket 相关
         self.access_token = None
         self.token_expires_at = 0
         self.ws = None
         self.is_running = False
         self.message_handler = None
         self._heartbeat_thread = None
-        self.heartbeat_interval = 30          # 默认值，后续由服务器更新
-        self.reconnect_attempts = reconnect_attempts           # 最大重连次数
-        self.reconnect_interval = reconnect_interval          # 重连间隔（秒）
-        self.should_reconnect = True          # 控制是否继续重连
-        self._current_attempt = 0
+        self.heartbeat_interval = 30    # 默认，由服务器更新
     
     def _get_api_base(self) -> str:
         """获取API基础地址"""
@@ -41,7 +50,7 @@ class QQClient:
         return self.API_BASE
     
     def get_access_token(self) -> Optional[str]:
-        """获取Access Token[reference:13][reference:14]"""
+        """获取Access Token"""
         if self.access_token and time.time() < self.token_expires_at:
             return self.access_token
         
@@ -71,9 +80,10 @@ class QQClient:
                 self.logger.error(f"获取Access Token异常: {e}")
             return None
     
-    def send_message(self, openid: str, content: str, msg_type: int = 0, 
+    # ---------- 发送消息接口 ----------
+    def send_message(self, openid: str, content: str, msg_type: int = 0,
                      msg_id: Optional[str] = None, is_wakeup: bool = False) -> bool:
-        """发送单聊消息[reference:15][reference:16]"""
+        """发送单聊消息"""
         token = self.get_access_token()
         if not token:
             return False
@@ -109,7 +119,7 @@ class QQClient:
     
     def send_group_message(self, group_openid: str, content: str, msg_type: int = 0,
                            msg_id: Optional[str] = None) -> bool:
-        """发送群聊消息[reference:17]"""
+        """发送群聊消息"""
         token = self.get_access_token()
         if not token:
             return False
@@ -175,81 +185,145 @@ class QQClient:
                 self.logger.error(f"发送频道消息异常: {e}")
             return False
     
+    # ---------- 事件处理 ----------
     def on_message(self, handler: Callable):
         """设置消息处理函数"""
         self.message_handler = handler
     
+    def _send_identify_or_resume(self, ws):
+        """
+        发送鉴权请求：优先尝试 RESUME，若无效则回退到 IDENTIFY
+        """
+        token = self.get_access_token()
+        if not token:
+            self.logger.error("无有效Token，无法发送鉴权请求")
+            return
+        
+        # 如果存在有效的 session_id 且允许恢复，则尝试 RESUME
+        if self.session_id and self._should_resume:
+            resume_payload = {
+                "op": 6,
+                "d": {
+                    "token": f"QQBot {token}",
+                    "session_id": self.session_id,
+                    "seq": self.last_seq
+                }
+            }
+            ws.send(json.dumps(resume_payload))
+            self.logger.info(f"已发送RESUME请求，session_id={self.session_id}, seq={self.last_seq}")
+        else:
+            # 否则执行完整的 IDENTIFY
+            # intents 根据您实际开通的权限调整，此处使用 96（群聊@ + C2C）
+            intents = (1 << 25)
+            identify_payload = {
+                "op": 2,
+                "d": {
+                    "token": f"QQBot {token}",
+                    "intents": intents
+                }
+            }
+            ws.send(json.dumps(identify_payload))
+            self.logger.info(f"已发送IDENTIFY鉴权，intents={intents}")
+            # 清除旧的会话信息，准备新会话
+            self.session_id = None
+            self.last_seq = 0
+            self._should_resume = False
+    
+    def _handle_dispatch(self, data: Dict[str, Any]):
+        """
+        处理 Dispatch (op=0) 事件
+        """
+        # 更新序列号
+        if 's' in data:
+            self.last_seq = data['s']
+        
+        event_type = data.get('t')
+        event_data = data.get('d', {})
+        
+        # 如果是 READY 事件，保存 session_id
+        if event_type == 'READY':
+            self.session_id = event_data.get('session_id')
+            self._should_resume = True
+            if self.logger:
+                self.logger.info(f"READY 事件，session_id={self.session_id}")
+        
+        # 分发具体消息事件
+        if event_type == 'GROUP_AT_MESSAGE_CREATE':
+            self._handle_group_at_message(event_data)
+        elif event_type == 'C2C_MESSAGE_CREATE':
+            self._handle_c2c_message(event_data)
+        elif event_type == 'DIRECT_MESSAGE_CREATE':
+            self._handle_direct_message(event_data)
+        # 可添加其他事件
+    
     def _on_ws_message(self, ws, message):
+        """WebSocket消息接收回调"""
         try:
             data = json.loads(message)
             op = data.get('op')
-            self.logger.debug(f"收到WebSocket消息: {data}")
             
-            if op == 10:  # Hello
+            if op == 10:   # Hello
                 d = data.get('d', {})
                 self.heartbeat_interval = d.get('heartbeat_interval', 30000) / 1000.0
                 self.logger.info(f"收到Hello，心跳间隔: {self.heartbeat_interval}秒")
-                self._send_identify(ws)
+                # 建立连接后立即发送鉴权
+                self._send_identify_or_resume(ws)
                 return
             
-            if op == 11:  # 心跳响应
+            if op == 11:   # 心跳响应
                 self.logger.debug("收到心跳响应")
                 return
             
-            if op == 0 and 't' in data:
-                event_type = data['t']
-                event_data = data.get('d', {})
-                # 根据事件类型分发
-                if event_type == 'GROUP_AT_MESSAGE_CREATE':
-                    self._handle_group_at_message(event_data)
-                elif event_type == 'C2C_MESSAGE_CREATE':
-                    self._handle_c2c_message(event_data)
-                elif event_type == 'DIRECT_MESSAGE_CREATE':
-                    self._handle_direct_message(event_data)
-                # 可以添加其他事件
+            if op == 0:    # Dispatch
+                self._handle_dispatch(data)
+                return
+            
+            if op == 7:    # RECONNECT - 服务端要求重连
+                self.logger.warning("收到 RECONNECT 指令，将重连并尝试恢复会话")
+                self._should_resume = True   # 保留 session_id 和 last_seq
+                # 主动关闭连接，触发重连循环
+                if self.ws:
+                    self.ws.close()
+                return
+            
+            if op == 9:    # Invalid Session - 会话无效，需要重新 IDENTIFY
+                d = data.get('d')
+                # d 为 True 表示可以重试，False 表示不可重试
+                if d is False:
+                    self.logger.error("Invalid Session (不可恢复)，清除会话信息，重新IDENTIFY")
+                    self.session_id = None
+                    self.last_seq = 0
+                    self._should_resume = False
+                    # 重新发送 IDENTIFY，但需要先关闭连接重连
+                    if self.ws:
+                        self.ws.close()
+                else:
+                    self.logger.warning("Invalid Session (可重试)，将重发鉴权")
+                    # 可尝试重发 IDENTIFY
+                    self._send_identify_or_resume(ws)
+                return
+            
+            # 其他 opcode 可忽略或记录
+            if op is not None:
+                self.logger.debug(f"收到未处理的 opcode: {op}, data: {data}")
         except json.JSONDecodeError as e:
             self.logger.error(f"解析WebSocket消息失败: {e}")
         except Exception as e:
             self.logger.error(f"处理WebSocket消息异常: {e}")
-
-    def _send_identify(self, ws):
-        token = self.get_access_token()
-        if not token:
-            self.logger.error("无有效Token，无法发送Identify")
-            return
-        
-        # 按需开启事件（位掩码）
-        # 常用事件位：
-        #   bit 4  : DIRECT_MESSAGE         (频道私信)
-        #   bit 5  : GROUP_AT_MESSAGE       (群聊@消息)
-        #   bit 6  : C2C_MESSAGE            (私聊消息)
-        # 根据需要，也可以添加其他位
-        intents = (1 << 25) # 群@ + C2C
-        
-        payload = {
-            "op": 2,
-            "d": {
-                "token": f"QQBot {token}",
-                "intents": intents
-            }
-        }
-        ws.send(json.dumps(payload))
-        self.logger.info(f"已发送Identify鉴权，intents={intents}")
     
     def _handle_group_at_message(self, data: Dict[str, Any]):
-        """处理群@消息[reference:19]"""
+        """处理群聊@消息"""
         if not self.message_handler:
             return
         
-        content = data.get('content', '')  # 已自动去除@机器人的前缀[reference:20]
+        content = data.get('content', '')
         group_openid = data.get('group_openid', '')
         author = data.get('author', {})
-        user_openid = author.get('member_openid', '')  # 群成员OpenID[reference:21]
+        user_openid = author.get('member_openid', '')
         user_name = author.get('username', '用户')
         msg_id = data.get('id', '')
-        attachments = data.get('attachments', [])  # 消息附件[reference:22]
+        attachments = data.get('attachments', [])
         
-        # 构造消息对象
         message = {
             'type': 'group',
             'content': content,
@@ -259,7 +333,6 @@ class QQClient:
             'msg_id': msg_id,
             'attachments': attachments
         }
-        
         self.message_handler(message)
     
     def _handle_c2c_message(self, data: Dict[str, Any]):
@@ -282,7 +355,6 @@ class QQClient:
             'msg_id': msg_id,
             'attachments': attachments
         }
-        
         self.message_handler(message)
     
     def _handle_direct_message(self, data: Dict[str, Any]):
@@ -307,10 +379,11 @@ class QQClient:
             'channel_id': channel_id,
             'attachments': attachments
         }
-        
         self.message_handler(message)
     
+    # ---------- 心跳 ----------
     def _heartbeat_loop(self):
+        """心跳线程"""
         while self.is_running:
             time.sleep(self.heartbeat_interval)
             if self.ws and self.ws.sock and self.ws.sock.connected:
@@ -319,13 +392,14 @@ class QQClient:
                     self.logger.debug("发送心跳")
                 except Exception as e:
                     self.logger.error(f"发送心跳失败: {e}")
-
     
+    # ---------- 连接与重连 ----------
     def connect(self):
-        """连接WebSocket，含自动重连"""
+        """连接WebSocket，含自动重连和会话恢复"""
         self.should_reconnect = True
-        self._current_attempt = 0
-
+        attempt = 0
+        self._current_attempt = 0  # 当前尝试计数
+        
         while self.should_reconnect and self._current_attempt < self.reconnect_attempts:
             self._current_attempt += 1
             token = self.get_access_token()
@@ -358,31 +432,42 @@ class QQClient:
             if not self.should_reconnect:
                 break
             
-            # 如果连接断开但未达到最大次数，等待间隔
+            # 如果未达到最大次数，等待间隔
             if self._current_attempt < self.reconnect_attempts:
                 self.logger.info(f"将在 {self.reconnect_interval} 秒后重连...")
                 time.sleep(self.reconnect_interval)
             else:
                 self.logger.error("已达到最大重连次数，放弃连接")
                 break
-
+        
         return self._current_attempt < self.reconnect_attempts
     
     def _on_ws_open(self, ws):
         self.logger.info("WebSocket连接已建立")
         self._current_attempt = 0   # 连接成功，重置尝试计数器
-        
+        # 注意：鉴权在收到 Hello (op10) 后触发，不在这里直接发送
+    
     def _on_ws_error(self, ws, error):
-        if self.logger:
-            self.logger.error(f"WebSocket错误: {error}")
+        self.logger.error(f"WebSocket错误: {error}")
     
     def _on_ws_close(self, ws, close_status_code, close_msg):
         self.logger.info(f"WebSocket连接已关闭: {close_status_code} - {close_msg}")
         self.is_running = False
-        # 不要在这里设置 should_reconnect = False，以便自动重连
-
+        # 对于可恢复的错误码（如4009），保留 session_id 和 last_seq
+        # 对于其他错误，可能也需要保留，因为 RESUME 可能仍能工作
+        # 除非是主动断开或 Invalid Session 已清除，否则保留
+        if close_status_code in [4009, 4014, 4015]:  # 常见可恢复错误
+            self.logger.info("连接因可恢复错误关闭，将尝试会话恢复")
+            self._should_resume = True
+        # 其他情况保留当前状态，重连时会尝试 RESUME
+    
     def disconnect(self):
+        """主动断开连接，阻止自动重连，并清除会话信息"""
         self.should_reconnect = False
         self.is_running = False
+        # 主动断开时应清除 session 信息，因为下次连接是全新的
+        self.session_id = None
+        self.last_seq = 0
+        self._should_resume = False
         if self.ws:
             self.ws.close()
