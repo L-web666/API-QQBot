@@ -28,10 +28,10 @@ class MessageProcessor:
         self.max_segment_length = self.config.get('max_segment_length', 2000)
         self.system_prompt = self.config.get('system_prompt', '你是一个智能助手。')
         self.require_mention = self.config.get('require_mention', True)
-        self.reply_with_mention = self.config.get('reply_with_mention', True)
         self.context_enabled = self.config.get('context_enabled', True)
         
-        self._task_queue = queue.Queue()
+        # 有界队列：达到 max_queue_size 后新消息被拒绝（返回繁忙提示），防止无限积压
+        self._task_queue = queue.Queue(maxsize=self.max_queue_size)
         self._processing = False
         self._worker_thread = None
     
@@ -55,15 +55,32 @@ class MessageProcessor:
             self.logger.info("消息处理器已停止")
     
     def submit(self, message: Dict[str, Any]):
-        """提交消息到处理队列"""
+        """提交消息到处理队列；队列满时给发送者返回"繁忙"提示"""
         try:
             self._task_queue.put(message, timeout=1)
             if self.logger:
                 self.logger.debug(f"消息已入队，当前队列大小: {self._task_queue.qsize()}")
         except queue.Full:
             if self.logger:
-                self.logger.warning("队列已满，消息被丢弃")
-            # 无法回复用户，因为没有用户信息直接发送
+                self.logger.warning("队列已满，向用户发送繁忙提示")
+            # 队列满：在新线程中回复"机器人忙"，避免阻塞WebSocket接收线程
+            threading.Thread(target=self._send_busy_reply, args=(message,), daemon=True).start()
+    
+    def _send_busy_reply(self, message: Dict[str, Any]):
+        """队列满时向发送者回复繁忙提示"""
+        try:
+            self._send_reply(
+                message.get('type', 'c2c'),
+                message.get('user_openid', ''),
+                message.get('user_name', '用户'),
+                message.get('group_openid', ''),
+                message.get('channel_id', ''),
+                message.get('msg_id', ''),
+                "🤖 机器人正在处理其他消息，请稍后再试。"
+            )
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"发送繁忙提示失败: {e}")
     
     def _worker_loop(self):
         """工作线程主循环"""
@@ -91,11 +108,21 @@ class MessageProcessor:
             group_openid = message.get('group_openid', '')
             channel_id = message.get('channel_id', '')
             
-            # 群聊特殊处理
+            # 群聊特殊处理：当前订阅的是 GROUP_AT_MESSAGE_CREATE 事件，
+            # 只有被@的消息才会推送到这里，因此 require_mention=True 天然成立。
+            # 若要支持 require_mention=False（回复所有群消息），需在开放平台
+            # 开通"群消息全量"权限并额外订阅对应事件后，再在这里处理。
+            
+            # ====== 上下文键：私聊与群聊分开存储（不同文件夹） ======
+            # 统一身份标识：新版QQ平台群聊/私聊的 openid 一致（事件 author.user_openid），
+            # 群聊事件取不到 user_openid 时回退到群成员标识 member_openid
+            unified_id = message.get('unified_openid') or user_openid
+            # 群聊：按 群ID+用户ID 区分（每个群的上下文相互独立）
             if msg_type == 'group':
-                if self.require_mention:
-                    # 已经是@消息事件，直接通过
-                    pass
+                context_key = f"group_{group_openid}_{unified_id}"
+            else:
+                # 私聊/频道私信：按用户ID存储（private/ 文件夹）
+                context_key = unified_id
             
             # ====== 改进1：有附件时不过滤无意义消息 ======
             has_attachments = bool(attachments)
@@ -108,12 +135,48 @@ class MessageProcessor:
             clear_commands = ["/clear", "/清空上下文", "/重置对话"]
             if content.strip() in clear_commands:
                 if self.context_enabled:
-                    self.context_manager.clear_context(user_openid)
+                    self.context_manager.clear_context(context_key)
                     self._send_reply(msg_type, user_openid, user_name, group_openid, 
                                     channel_id, msg_id, "✅ 已清空您的对话历史。")
                 else:
                     self._send_reply(msg_type, user_openid, user_name, group_openid, 
                                     channel_id, msg_id, "⚠️ 上下文功能未启用。")
+                return
+            
+            # ===== 新增：把私聊上下文转移到当前群聊 =====
+            # 主命令：/转移私聊到群聊（8字符）；保留旧命令作为别名
+            transfer_commands = ["/转移私聊到群聊", "/将我的私聊上下文转移到当前群聊", "/转移私聊上下文", "/导入私聊上下文"]
+            if msg_type == 'group' and content.strip() in transfer_commands:
+                if not self.context_enabled:
+                    self._send_reply(msg_type, user_openid, user_name, group_openid,
+                                    channel_id, msg_id, "⚠️ 上下文功能未启用。")
+                    return
+                self._transfer_private_context(msg_type, user_openid, user_name,
+                                               group_openid, channel_id, msg_id,
+                                               unified_id, context_key)
+                return
+            
+            # ===== 新增：用转移码绑定身份（绑定成功后立即转移） =====
+            if msg_type == 'group' and content.strip().startswith("/绑定转移码"):
+                if not self.context_enabled:
+                    self._send_reply(msg_type, user_openid, user_name, group_openid,
+                                    channel_id, msg_id, "⚠️ 上下文功能未启用。")
+                    return
+                self._bind_and_transfer(msg_type, user_openid, user_name,
+                                        group_openid, channel_id, msg_id, content, context_key)
+                return
+            
+            # ===== 新增：私聊中生成转移码 =====
+            if msg_type == 'c2c' and content.strip() == "/生成转移码":
+                if not self.context_enabled:
+                    self._send_reply(msg_type, user_openid, user_name, group_openid,
+                                    channel_id, msg_id, "⚠️ 上下文功能未启用。")
+                    return
+                code = self.context_manager.create_transfer_code(user_openid)
+                self._send_reply(msg_type, user_openid, user_name, group_openid,
+                                channel_id, msg_id,
+                                f"🔑 您的转移码：{code}（10分钟内有效）。\n"
+                                f"请在目标群聊发送：/绑定转移码 {code}")
                 return
             
             # 关键词匹配（优先处理，避免浪费token）
@@ -138,7 +201,7 @@ class MessageProcessor:
             # 获取上下文并调用AI
             if self.context_enabled:
                 messages = self.context_manager.get_messages_for_ai(
-                    user_openid, self.system_prompt, content
+                    context_key, self.system_prompt, content
                 )
             else:
                 messages = [
@@ -164,8 +227,8 @@ class MessageProcessor:
             
             # ====== 改进4：仅当回复不是错误信息时才保存上下文 ======
             if self.context_enabled and ai_response and not ai_response.startswith("AI服务"):
-                self.context_manager.add_message(user_openid, 'user', content)
-                self.context_manager.add_message(user_openid, 'assistant', ai_response)
+                self.context_manager.add_message(context_key, 'user', content)
+                self.context_manager.add_message(context_key, 'assistant', ai_response)
             
             # 发送回复（即使是错误信息也发送给用户）
             self._send_reply(msg_type, user_openid, user_name, group_openid, 
@@ -189,6 +252,82 @@ class MessageProcessor:
                 if self.logger:
                     self.logger.error(f"发送错误回复时失败: {send_err}")
     
+    def _merge_private_into_group(self, group_context_key: str,
+                                  private_history: List[Dict[str, str]]) -> Optional[int]:
+        """
+        将私聊历史合并到群聊上下文：保留群聊原有上下文，只追加群聊中尚不存在的私聊记录。
+        （按 role+content 去重，重复转移或部分新增时不会产生重复记录）
+        返回 (新增条数, 合并后总条数)；没有新内容可追加（已合并过）返回 None。
+        """
+        existing = self.context_manager.get_context(group_context_key)
+        existing_keys = {(m.get('role'), m.get('content')) for m in existing}
+        new_entries = [m for m in private_history
+                       if (m.get('role'), m.get('content')) not in existing_keys]
+        if not new_entries:
+            return None
+        merged = existing + new_entries
+        self.context_manager.set_context(group_context_key, merged)
+        return len(new_entries), len(merged)
+
+    def _transfer_private_context(self, msg_type: str, user_openid: str, user_name: str,
+                                  group_openid: str, channel_id: str, msg_id: str,
+                                  unified_openid: str, group_context_key: str):
+        """把用户私聊上下文合并到当前群聊上下文（保留群聊原有内容）"""
+        # user_openid 在群聊中即 member_openid（用于@提醒等）；
+        # unified_openid 是与私聊一致的统一用户标识，用它读取私聊上下文。
+        # 若直接取不到，再尝试身份绑定映射（针对旧版两套 openid 命名空间的情况）
+        bound = self.context_manager.get_bound_user_openid(user_openid)
+        private_owner = bound or unified_openid
+        private_history = self.context_manager.get_context(private_owner)
+        if not private_history:
+            if bound is None:
+                self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                                 "未找到您的私聊上下文。请先在私聊中和机器人对话产生记录；"
+                                 "若您的群聊与私聊标识不一致，请在私聊发送 /生成转移码，"
+                                 "然后在这里发送 /绑定转移码 <6位码> 绑定后重试。")
+            else:
+                self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                                 "您的私聊上下文中暂无历史记录，无法转移。")
+            return
+        result = self._merge_private_into_group(group_context_key, private_history)
+        if result is None:
+            self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                             "✅ 私聊上下文已存在于当前群聊中，未重复合并。")
+        else:
+            added, total = result
+            self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                             f"✅ 已将 {added} 条私聊记录合并到当前群聊（共 {total} 条）。")
+    
+    def _bind_and_transfer(self, msg_type: str, user_openid: str, user_name: str,
+                           group_openid: str, channel_id: str, msg_id: str,
+                           content: str, group_context_key: str):
+        """校验转移码并绑定身份，绑定成功后立即转移私聊上下文"""
+        parts = content.strip().split()
+        if len(parts) < 2:
+            self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                             "用法：/绑定转移码 <6位码>（码请在私聊中发送 /生成转移码 获取）")
+            return
+        code = parts[-1].strip()
+        # user_openid 在群聊中即 member_openid，绑定的是"群成员 -> 私聊用户"的映射
+        bound_user_openid = self.context_manager.bind_transfer_code(user_openid, code)
+        if not bound_user_openid:
+            self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                             "❌ 转移码无效或已过期，请在私聊中重新发送 /生成转移码。")
+            return
+        private_history = self.context_manager.get_context(bound_user_openid)
+        if private_history:
+            result = self._merge_private_into_group(group_context_key, private_history)
+            if result is None:
+                self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                                 "✅ 身份绑定成功（私聊上下文已存在于当前群聊，未重复合并）。")
+            else:
+                added, total = result
+                self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                                 f"✅ 身份绑定成功，已将 {added} 条私聊记录合并到当前群聊（共 {total} 条）。")
+        else:
+            self._send_reply(msg_type, user_openid, user_name, group_openid, channel_id, msg_id,
+                             "✅ 身份绑定成功（私聊暂无历史记录，未转移）。")
+    
     def _send_reply(self, msg_type: str, user_openid: str, user_name: str,
                     group_openid: str, channel_id: str, msg_id: str, content: str):
         """发送回复（支持分段）"""
@@ -196,10 +335,7 @@ class MessageProcessor:
         segments = self._split_message(content, self.max_segment_length)
         
         for i, segment in enumerate(segments):
-            # 在群聊或频道中，回复开头加上@用户昵称
-            if msg_type in ['group', 'channel'] and self.reply_with_mention:
-                if i == 0:  # 只在第一段添加@
-                    segment = f"@{user_name} {segment}"
+            # 已按需求移除群聊/频道回复开头的@用户前缀（不@人，直接发送回复内容）
             
             # 发送消息
             if msg_type == 'c2c':
@@ -207,10 +343,11 @@ class MessageProcessor:
             elif msg_type == 'group':
                 self.qq_client.send_group_message(group_openid, segment, msg_id=msg_id if i == 0 else None)
             elif msg_type == 'channel':
-                self.qq_client.send_channel_message(channel_id, segment, msg_id=msg_id if i == 0 else None)
+                # 频道私信（DIRECT_MESSAGE_CREATE）的回复应发给用户本人，走单聊消息接口
+                self.qq_client.send_message(user_openid, segment, msg_id=msg_id if i == 0 else None)
             
-            # 分段之间稍作延迟，避免频控
-            if len(segments) > 1:
+            # 分段之间稍作延迟，避免频控（最后一段之后无需等待）
+            if i < len(segments) - 1:
                 time.sleep(0.5)
         
         if self.logger:
@@ -227,7 +364,7 @@ class MessageProcessor:
         
         for line in lines:
             if len(current) + len(line) + 1 <= max_length:
-                current += line + '\n' if current else line + '\n'
+                current += line + '\n'
             else:
                 if current:
                     segments.append(current.strip())

@@ -5,6 +5,7 @@
 
 import os
 import base64
+from urllib.parse import urlparse
 import requests
 from typing import List, Dict, Any, Optional
 
@@ -96,8 +97,9 @@ class FileHandler:
                 if 'image' in content_type:
                     img_type = content_type.split('/')[-1]  # png, jpeg, gif ...
                 else:
-                    # 从URL后缀猜测
-                    ext = url.split('.')[-1].lower() if '.' in url else 'png'
+                    # 从URL路径后缀猜测（忽略查询参数等，如 ?sign=xxx）
+                    path = urlparse(url).path
+                    ext = path.split('.')[-1].lower() if '.' in path else ''
                     img_type = 'png' if ext not in ['jpg', 'jpeg', 'gif', 'webp'] else ext
                 
                 b64_data = base64.b64encode(response.content).decode('utf-8')

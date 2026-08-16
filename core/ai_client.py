@@ -67,7 +67,9 @@ class AIClient:
                 self.logger.error(f"AI调用异常 (尝试 {attempt+1}/{retries+1}): {e}")
                 if attempt == retries:
                     return "AI服务暂时不可用，请稍后再试。"
-            time.sleep(2 ** attempt)  # 指数退避
+            # 仅在还有重试机会时指数退避，最后一次失败后直接返回，不再空等
+            if attempt < retries:
+                time.sleep(2 ** attempt)
         return "AI服务暂时不可用，请稍后再试。"
     
     def chat_with_files(self, messages: List[Dict[str, str]], 
@@ -213,12 +215,12 @@ class AIClient:
             r'【思考】.*?【/思考】',
             r'\[思考\].*?\[/思考\]',
             r'--- 思考过程 ---.*?--- 回答 ---',
-            r'思考：.*?(?=\n\n|\Z)',
+            r'^思考：[^\n]*(\n|$)',          # 仅删除以"思考："开头的整行，避免误删正文
         ]
         
         filtered = content
         for pattern in patterns:
-            filtered = re.sub(pattern, '', filtered, flags=re.DOTALL | re.IGNORECASE)
+            filtered = re.sub(pattern, '', filtered, flags=re.DOTALL | re.MULTILINE | re.IGNORECASE)
         
         filtered = re.sub(r'\n\s*\n', '\n\n', filtered)
         return filtered.strip()

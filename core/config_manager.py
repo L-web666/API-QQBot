@@ -38,8 +38,7 @@ class ConfigManager:
         },
         # 群聊配置
         "group": {
-            "require_mention": True,          # 群聊是否只有被@时才回复
-            "reply_with_mention": True        # 回复时是否@用户
+            "require_mention": True           # 群聊是否只有被@时才回复
         },
         # 消息处理配置
         "message": {
@@ -106,7 +105,6 @@ class ConfigManager:
 【群聊配置】group
 
   require_mention    : True=只有被@时才回复，False=回复所有群消息
-  reply_with_mention : True=回复时@用户，False=不@
 
 【消息处理配置】message
 

@@ -9,9 +9,27 @@ import os
 import signal
 from typing import Dict, Any
 
-# 添加core模块到路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+def get_base_dir():
+    """
+    获取程序根目录：
+    - 开发环境：返回当前文件所在目录
+    - 打包后（PyInstaller）：返回 exe 所在目录
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+# 切换到根目录，确保相对路径（config.json, data/ 等）正确
+BASE_DIR = get_base_dir()
+os.chdir(BASE_DIR)
+
+# 将根目录加入模块搜索路径，以便导入 core 包
+sys.path.insert(0, BASE_DIR)
+
+# 导入 core 模块
 from core.config_manager import ConfigManager
 from core.logger import Logger
 from core.context_manager import ContextManager
@@ -108,7 +126,6 @@ class QQAIbot:
             'max_segment_length': self.config.get('message', {}).get('max_segment_length', 2000),
             'system_prompt': self.config.get('system_prompt', '你是一个智能助手。'),
             'require_mention': self.config.get('group', {}).get('require_mention', True),
-            'reply_with_mention': self.config.get('group', {}).get('reply_with_mention', True),
             'context_enabled': self.config.get('context', {}).get('enabled', True)
         }
         

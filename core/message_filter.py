@@ -13,10 +13,10 @@ class MessageFilter:
     MEANINGLESS_PATTERNS = [
         r'^[\d\s]+$',                        # 纯数字
         r'^[\W_]+$',                         # 纯符号/标点
-        r'^[\w]$',                           # 单个字母或数字
+        r'^[a-zA-Z0-9]$',                    # 单个字母或数字（不含单个中文，避免误伤）
         r'^[\s]*$',                          # 空白
         r'^[.。，,、；;：:！!？?…·~\s]+$',    # 纯标点符号
-        r'^[😀-🙏][\u200d]?[😀-🙏]*$',      # 纯表情（简化版）
+        r'^[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+$',  # 纯表情（覆盖主流emoji区块）
     ]
     
     def __init__(self, config: Dict[str, Any]):
@@ -36,12 +36,9 @@ class MessageFilter:
         if not text:
             return True
 
-        # 如果包含中文字符、字母或数字，则认为是有意义消息，不过滤
-        import re
-        if re.search(r'[\u4e00-\u9fa5a-zA-Z0-9]', text):
-            return False
-        
-        # 否则检测是否只包含标点、空白、表情等
+        # 命中任一"无意义"模式即过滤（纯数字、纯符号、单个字母/数字、空白、纯表情等）。
+        # 注意：不能提前用"含中文/字母/数字即有意义"短路判断，
+        # 否则上面的纯数字、单字符等模式永远无法命中。
         for pattern in self.MEANINGLESS_PATTERNS:
             if re.match(pattern, text, re.UNICODE):
                 return True

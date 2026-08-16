@@ -33,6 +33,7 @@ class QQClient:
         self.session_id = None          # 会话ID，由 READY 事件提供
         self.last_seq = 0               # 最后收到的消息序列号
         self._should_resume = False     # 是否尝试恢复会话
+        self.last_heartbeat_ack = 0     # 最近一次收到服务器响应（心跳回执/事件）的时间
         
         # WebSocket 相关
         self.access_token = None
@@ -48,6 +49,12 @@ class QQClient:
         if self.sandbox:
             return "https://sandbox.api.sgroup.qq.com"
         return self.API_BASE
+    
+    def _get_ws_gateway(self) -> str:
+        """获取WebSocket网关地址（沙箱与正式环境不同）"""
+        if self.sandbox:
+            return "wss://sandbox.api.sgroup.qq.com/websocket"
+        return self.WSS_GATEWAY
     
     def get_access_token(self) -> Optional[str]:
         """获取Access Token"""
@@ -213,8 +220,9 @@ class QQClient:
             self.logger.info(f"已发送RESUME请求，session_id={self.session_id}, seq={self.last_seq}")
         else:
             # 否则执行完整的 IDENTIFY
-            # intents 根据您实际开通的权限调整，此处使用 96（群聊@ + C2C）
-            intents = (1 << 25)
+            # intents 按需订阅：25=群聊@消息(GROUP_AT_MESSAGE_CREATE)，26=C2C单聊消息(C2C_MESSAGE_CREATE)
+            # 如需频道消息/频道私信等，需额外开通对应权限后再追加对应的 intent 位
+            intents = (1 << 25) | (1 << 26)
             identify_payload = {
                 "op": 2,
                 "d": {
@@ -244,6 +252,10 @@ class QQClient:
         if event_type == 'READY':
             self.session_id = event_data.get('session_id')
             self._should_resume = True
+            # 鉴权成功才算真正连上，此时才重置重连计数（避免鉴权失败时无限重连）
+            self._current_attempt = 0
+            # 收到服务器数据，视为连接存活
+            self.last_heartbeat_ack = time.time()
             if self.logger:
                 self.logger.info(f"READY 事件，session_id={self.session_id}")
         
@@ -266,15 +278,19 @@ class QQClient:
                 d = data.get('d', {})
                 self.heartbeat_interval = d.get('heartbeat_interval', 30000) / 1000.0
                 self.logger.info(f"收到Hello，心跳间隔: {self.heartbeat_interval}秒")
+                self.last_heartbeat_ack = time.time()
                 # 建立连接后立即发送鉴权
                 self._send_identify_or_resume(ws)
                 return
             
             if op == 11:   # 心跳响应
                 self.logger.debug("收到心跳响应")
+                self.last_heartbeat_ack = time.time()
                 return
             
             if op == 0:    # Dispatch
+                # 收到任何事件都说明连接存活，更新心跳时间戳
+                self.last_heartbeat_ack = time.time()
                 self._handle_dispatch(data)
                 return
             
@@ -319,7 +335,11 @@ class QQClient:
         content = data.get('content', '')
         group_openid = data.get('group_openid', '')
         author = data.get('author', {})
-        user_openid = author.get('member_openid', '')
+        member_openid = author.get('member_openid', '')
+        # 实测（本机器人）：群聊事件 author 不含 user_openid 字段，
+        # 且 member_openid 与私聊事件的 user_openid 值相同；
+        # 仍保留 user_openid 优先读取，兼容平台未来行为变化（如事件携带 user_openid 或两套标识分离）
+        unified_openid = author.get('user_openid') or member_openid
         user_name = author.get('username', '用户')
         msg_id = data.get('id', '')
         attachments = data.get('attachments', [])
@@ -328,7 +348,8 @@ class QQClient:
             'type': 'group',
             'content': content,
             'group_openid': group_openid,
-            'user_openid': user_openid,
+            'user_openid': member_openid,        # 群@提醒使用群成员标识
+            'unified_openid': unified_openid,     # 统一的用户身份标识（用于上下文存取）
             'user_name': user_name,
             'msg_id': msg_id,
             'attachments': attachments
@@ -383,22 +404,34 @@ class QQClient:
     
     # ---------- 心跳 ----------
     def _heartbeat_loop(self):
-        """心跳线程"""
+        """心跳线程 - 定时发送心跳，并检测连接假死（超时未收到任何服务器响应）"""
         while self.is_running:
             time.sleep(self.heartbeat_interval)
-            if self.ws and self.ws.sock and self.ws.sock.connected:
+            if not (self.ws and self.ws.sock and self.ws.sock.connected):
+                continue
+            
+            # 心跳超时检测：超过 3 个心跳周期未收到任何服务器数据，判定连接假死
+            # （如网络静默丢包、半开连接），主动断开以触发重连逻辑
+            timeout = max(self.heartbeat_interval * 3, 30)
+            if self.last_heartbeat_ack and time.time() - self.last_heartbeat_ack > timeout:
+                self.logger.warning(f"心跳超时（{timeout:.0f}秒未收到服务器响应），主动断开以触发重连")
                 try:
-                    self.ws.send(json.dumps({"op": 1, "d": None}))
-                    self.logger.debug("发送心跳")
+                    self.ws.close()
                 except Exception as e:
-                    self.logger.error(f"发送心跳失败: {e}")
+                    self.logger.error(f"主动断开连接失败: {e}")
+                continue
+            
+            try:
+                self.ws.send(json.dumps({"op": 1, "d": None}))
+                self.logger.debug("发送心跳")
+            except Exception as e:
+                self.logger.error(f"发送心跳失败: {e}")
     
     # ---------- 连接与重连 ----------
     def connect(self):
         """连接WebSocket，含自动重连和会话恢复"""
         self.should_reconnect = True
-        attempt = 0
-        self._current_attempt = 0  # 当前尝试计数
+        self._current_attempt = 0  # 当前尝试计数（鉴权成功前不会被重置）
         
         while self.should_reconnect and self._current_attempt < self.reconnect_attempts:
             self._current_attempt += 1
@@ -408,7 +441,8 @@ class QQClient:
                 time.sleep(self.reconnect_interval)
                 continue
             
-            ws_url = f"{self.WSS_GATEWAY}?access_token={token}"
+            # 鉴权通过连接内的 Identify(op2) 包完成，token 不放入 URL，避免泄露到网关/代理日志
+            ws_url = self._get_ws_gateway()
             self.ws = websocket.WebSocketApp(
                 ws_url,
                 on_message=self._on_ws_message,
@@ -444,8 +478,9 @@ class QQClient:
     
     def _on_ws_open(self, ws):
         self.logger.info("WebSocket连接已建立")
-        self._current_attempt = 0   # 连接成功，重置尝试计数器
         # 注意：鉴权在收到 Hello (op10) 后触发，不在这里直接发送
+        # 重连计数不在此处重置，而是在鉴权成功（收到 READY）后重置，
+        # 否则 AppID/Secret 无效导致鉴权失败时会陷入无限重连
     
     def _on_ws_error(self, ws, error):
         self.logger.error(f"WebSocket错误: {error}")
@@ -453,13 +488,12 @@ class QQClient:
     def _on_ws_close(self, ws, close_status_code, close_msg):
         self.logger.info(f"WebSocket连接已关闭: {close_status_code} - {close_msg}")
         self.is_running = False
-        # 对于可恢复的错误码（如4009），保留 session_id 和 last_seq
-        # 对于其他错误，可能也需要保留，因为 RESUME 可能仍能工作
-        # 除非是主动断开或 Invalid Session 已清除，否则保留
-        if close_status_code in [4009, 4014, 4015]:  # 常见可恢复错误
-            self.logger.info("连接因可恢复错误关闭，将尝试会话恢复")
+        self.last_heartbeat_ack = 0
+        # 主动断开（disconnect）时不恢复会话；其余情况只要存在历史 session_id 就尝试 RESUME。
+        # 即便 RESUME 被服务器拒绝，也会收到 Invalid Session(op9) 并自动回退到重新 IDENTIFY，
+        # 因此无需按关闭错误码细分处理。
+        if self.should_reconnect and self.session_id:
             self._should_resume = True
-        # 其他情况保留当前状态，重连时会尝试 RESUME
     
     def disconnect(self):
         """主动断开连接，阻止自动重连，并清除会话信息"""
