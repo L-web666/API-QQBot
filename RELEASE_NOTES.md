@@ -33,9 +33,3 @@ cp config.json.example config.json
 # 编辑 config.json：填写 QQ AppID/AppSecret 与 AI 的 api_key/base_url/model
 python qqbot.py
 ```
-
-## ⚠️ 注意事项
-
-- `config.json` 含 AppSecret 与 API Key，已加入 `.gitignore`，**切勿提交到公开仓库**
-- 群聊被动回复会被 QQ 平台自动 @ 原消息发送者，属官方行为，无法关闭
-- `require_mention: false`（回复所有群消息）需开放平台"群消息全量"权限，暂未实现
