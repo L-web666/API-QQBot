@@ -1,0 +1,34 @@
+{
+  "qq": {
+    "app_id": "请填写你的APPID",
+    "app_secret": "请填写你的APPSECRET",
+    "sandbox": false,
+    "reconnect_attempts": 5,
+    "reconnect_interval": 10
+  },
+  "api_key": "请填写你的API密钥",
+  "base_url": "https://api.openai.com/v1",
+  "model": "请填写模型名称（如 gpt-3.5-turbo）",
+  "system_prompt": "你是一个智能、友好的AI助手，请用中文回复用户的问题。",
+  "filter": {
+    "exact_match_keywords": [],
+    "fuzzy_match_keywords": [],
+    "exact_match_responses": {},
+    "fuzzy_match_responses": {}
+  },
+  "group": {
+    "require_mention": true
+  },
+  "message": {
+    "max_segment_length": 2000,
+    "max_queue_size": 10,
+    "filter_meaningless": true
+  },
+  "context": {
+    "max_history": 20,
+    "enabled": true
+  },
+  "log": {
+    "max_size_mb": 10
+  }
+}
