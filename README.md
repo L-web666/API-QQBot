@@ -174,7 +174,6 @@ def on_stop(bot):
 
 ## ⚠️ 安全提示
 
-- `config.json` 包含 AppSecret 与 API Key，**已被 `.gitignore` 排除，请勿强行提交到公开仓库**
 - 部署请使用自己的密钥，谨防泄露
 
 ## 📄 其他
