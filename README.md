@@ -46,6 +46,7 @@ API_qqbot/
 ├── qqbot.py                  # 主程序入口
 ├── config.json               # 配置文件（运行时生成/填写，已被 .gitignore 排除）
 ├── core/
+|   ├── __init__.py           # 让core变成可import的包
 │   ├── qq_client.py          # QQ 机器人客户端（WebSocket、心跳、重连、会话恢复）
 │   ├── ai_client.py          # AI 服务客户端（OpenAI 兼容、多模态、重试）
 │   ├── message_processor.py  # 消息处理器（队列、分段发送、指令）
@@ -60,8 +61,7 @@ API_qqbot/
 ├── plugins/                  # 插件目录（用户可自行添加，无需改代码）
 │   ├── 示例插件.py           # 回复型插件示例
 │   ├── 多文件示例/           # 多文件插件示例
-│   ├── 桥接转发示例.py       # 连接型（桥接）插件示例
-│   └── README.md             # 插件接口标准说明
+│   └── 桥接转发示例.py       # 连接型（桥接）插件示例
 └── data/                     # 运行时数据（日志、用户上下文、统计，已被 .gitignore 排除）
 ```
 
