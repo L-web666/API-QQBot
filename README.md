@@ -57,6 +57,112 @@ API_qqbot/
 └── data/                     # 运行时数据（日志、用户上下文，已被 .gitignore 排除）
 ```
 
+# QQ AI Bot 插件说明（接口标准 v1）
+
+## 怎么用
+
+1. 在 `plugins/` 目录新建插件：
+   - **单文件插件**：一个 `.py` 文件
+   - **多文件插件**：一个文件夹（入口 `__init__.py` 或 `main.py`，其余 `.py` 是辅助模块）
+2. 按下面的格式写内容
+3. 在 Web 管理后台「插件」页点「🔄 重新加载」，或重启机器人
+4. 完成！**不需要改任何程序源代码**
+
+## 启用 / 停用插件
+
+- 在 Web 管理后台「🧩 插件」页，每个插件都有「▶️ 启用 / ⏸️ 停用」按钮
+- 停用/启用**立即生效**，且状态会保存（重启机器人后保持）
+- 停用的插件不会加载，也不会执行
+
+## 多文件插件（一个插件多个 .py 文件）
+
+当插件逻辑较多时，可以用一个文件夹装多个文件：
+
+```
+plugins/我的插件/
+├── __init__.py     ← 入口（写 PLUGIN / on_message 等，接口和单文件一样）
+└── helper.py       ← 辅助模块（随便叫什么名字）
+```
+
+入口文件里用普通 import 引用辅助模块（插件系统会把插件目录加入搜索路径）：
+
+```python
+import helper          # 引用同目录的 helper.py
+
+def on_message(msg):
+    return helper.do_something(msg)
+```
+
+入口文件优先级：`__init__.py` → `main.py` → 与目录同名的 `.py` → 目录里第一个含接口的 `.py`。
+
+
+## 两类插件
+
+### 一、回复型插件（给用户回复内容）
+
+```python
+PLUGIN = {"name": "我的功能", "description": "说明", "version": "1.0.0", "author": "你"}
+
+COMMANDS = ["/天气"]              # 消息等于它、或 "/天气 北京" 这种带参数
+KEYWORDS = ["天气"]               # 消息包含它就触发
+def match(msg):                   # 完全自定义匹配（可三选一/组合）
+    return msg.get("content", "").startswith("/xxx")
+
+def on_message(msg):
+    # msg 字段：
+    #   type        消息类型: "c2c"私聊 / "group"群聊 / "channel"频道私信
+    #   content     消息文本
+    #   user_openid 发送者 openid
+    #   user_name   发送者昵称
+    #   group_openid 群 openid（私聊为空）
+    #   msg_id      消息 ID
+    return "要回复给用户的内容"    # 返回字符串 = 回复；返回 None = 不回复
+```
+
+### 二、连接型/桥接型插件（连接两个东西，不一定要回复用户）
+
+适合：把消息转发到外部 Webhook/API、跨平台桥接、后台定时主动推送、
+监听外部事件等。写法：`on_message` 带第二个参数 `bot`，再可选加 `on_start/on_stop`。
+
+```python
+PLUGIN = {"name": "桥接", "description": "...", "version": "1.0.0", "author": "你"}
+
+def on_message(msg, bot):
+    # bot 提供：
+    #   bot.send_message(openid, text)        主动发私聊
+    #   bot.send_group_message(group_openid, text)  主动发群消息
+    #   bot.config                           当前配置
+    #   bot.log(...) / bot.info(...) / bot.error(...)  写日志
+    # 在这里调用外部 API、转发消息等...
+    return None        # 返回 None = 不回复用户（消息继续走内置逻辑）
+
+def on_start(bot):
+    # 机器人启动时调用一次：适合启动后台线程、建立连接、开始监听
+    # 例：threading.Thread(target=..., args=(bot,), daemon=True).start()
+    pass
+
+def on_stop(bot):
+    # 机器人停止时调用：清理后台线程/连接
+    pass
+```
+
+## 规则细节
+
+- **优先级**：插件在敏感词检查之后、内置指令（/帮助 /clear 等）之前执行
+- **多个插件**：按文件名字母顺序逐个询问，第一个给出回复（返回非空字符串）的插件生效
+- **匹配**：`COMMANDS` 支持带参数（`/天气 北京` 会命中 `/天气`）；`KEYWORDS` 是包含匹配；`match` 最灵活
+- **连接型插件**：只有 `on_start`（没有 `on_message`）也可以——它只做后台工作，不参与消息回复
+- **安全**：插件代码会直接运行，请只放你信任的文件；写错或抛异常会被捕获，不会弄崩机器人，但日志里会有记录
+
+## 小技巧
+
+- 插件是常驻内存的，模块里的全局变量会一直保留（比如记数、缓存）
+- 想在插件里调外部 API？直接 `import requests` 即可（程序已安装）
+- 想调试？在插件里 `print(...)` 或 `bot.log(...)` 会显示在机器人日志里
+- 参考示例：
+  - `plugins/示例插件.py`（回复型）
+  - `plugins/桥接转发示例.py`（连接型）
+
 ## 📄 其他
 
 - 变更记录见 [CHANGELOG.md](CHANGELOG.md)

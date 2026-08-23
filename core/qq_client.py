@@ -9,6 +9,8 @@ import requests
 import websocket
 from typing import Optional, Dict, Any, Callable
 
+from core.logger import mask_transfer_code
+
 
 class QQClient:
     """QQ机器人客户端，支持自动重连和会话恢复（RESUME）"""
@@ -113,7 +115,7 @@ class QQClient:
             response = requests.post(url, headers=headers, json=data, timeout=30)
             if response.status_code == 200:
                 if self.logger:
-                    self.logger.debug(f"消息发送成功: {content[:50]}...")
+                    self.logger.debug(f"消息发送成功: {mask_transfer_code(content)[:50]}...")
                 return True
             else:
                 if self.logger:
@@ -147,7 +149,7 @@ class QQClient:
             response = requests.post(url, headers=headers, json=data, timeout=30)
             if response.status_code == 200:
                 if self.logger:
-                    self.logger.debug(f"群消息发送成功: {content[:50]}...")
+                    self.logger.debug(f"群消息发送成功: {mask_transfer_code(content)[:50]}...")
                 return True
             else:
                 if self.logger:
@@ -181,7 +183,7 @@ class QQClient:
             response = requests.post(url, headers=headers, json=data, timeout=30)
             if response.status_code == 200:
                 if self.logger:
-                    self.logger.debug(f"频道消息发送成功: {content[:50]}...")
+                    self.logger.debug(f"频道消息发送成功: {mask_transfer_code(content)[:50]}...")
                 return True
             else:
                 if self.logger:
@@ -190,6 +192,172 @@ class QQClient:
         except Exception as e:
             if self.logger:
                 self.logger.error(f"发送频道消息异常: {e}")
+            return False
+    
+    # ---------- 指令面板 ----------
+    # 官方接口（请求格式已按文档确认）：
+    #   POST /v2/panels              创建指令面板
+    #   PUT  /v2/panels/{panel_id}   修改指令面板
+    # 创建/修改请求体：
+    #   { "scope": "c2c"|"group", "target_type": "all"|"specific",
+    #     "user_openids"|"group_openids": [...],   # target_type=specific 时
+    #     "panel": { "items": [{"type":"command","name":..,"desc":..} | {"type":"link","name":..,"link":..}], "remark": .. } }
+    def create_command_panel(self, scope: str, target_type: str, items: list,
+                             remark: str = '', openids: list = None) -> Optional[str]:
+        """创建指令面板，成功返回 panel_id，失败返回 None"""
+        token = self.get_access_token()
+        if not token:
+            return None
+        url = f"{self._get_api_base()}/v2/panels"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        data = {
+            "scope": scope,
+            "target_type": target_type,
+            "panel": {"items": items or []}
+        }
+        if remark:
+            data["panel"]["remark"] = remark
+        if target_type == 'specific' and openids:
+            data["user_openids" if scope == 'c2c' else "group_openids"] = list(openids)
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                panel_id = result.get('panel_id') or (result.get('data') or {}).get('panel_id')
+                if self.logger:
+                    self.logger.info(f"指令面板创建成功({scope}/{target_type}) panel_id={panel_id}")
+                return panel_id
+            else:
+                if self.logger:
+                    self.logger.error(f"指令面板创建失败: {response.status_code} {response.text}")
+                    # 记录请求体（脱敏），便于对照官方文档排查
+                    import json as _json
+                    self.logger.error(f"指令面板创建请求体({scope}): {_json.dumps(data, ensure_ascii=False)[:800]}")
+                return None
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"指令面板创建异常: {e}")
+            return None
+    
+    def update_command_panel(self, panel_id: str, scope: str, target_type: str, items: list,
+                             remark: str = '', openids: list = None) -> bool:
+        """更新已有指令面板"""
+        token = self.get_access_token()
+        if not token:
+            return False
+        url = f"{self._get_api_base()}/v2/panels/{panel_id}"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        data = {
+            "scope": scope,
+            "target_type": target_type,
+            "panel": {"items": items or []}
+        }
+        if remark:
+            data["panel"]["remark"] = remark
+        if target_type == 'specific' and openids:
+            data["user_openids" if scope == 'c2c' else "group_openids"] = list(openids)
+        try:
+            response = requests.put(url, headers=headers, json=data, timeout=30)
+            if response.status_code in (200, 204):
+                if self.logger:
+                    self.logger.info(f"指令面板更新成功（{len(data['panel']['items'])} 条指令）")
+                return True
+            else:
+                if self.logger:
+                    self.logger.error(f"指令面板更新失败: {response.status_code} {response.text}")
+                return False
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"指令面板更新异常: {e}")
+            return False
+    
+    def list_command_panels(self, scope: str = 'c2c', with_raw: bool = False):
+        """查询指令面板列表（GET /v2/panels?scope=c2c|group），scope 必填，否则报"生效场景不合法"。
+
+        返回面板列表（每个元素为 dict）。with_raw=True 时返回 (panels, raw_text)，
+        raw_text 为接口原始响应，便于诊断返回结构。
+
+        官方列表接口为分页格式：响应含 is_end（是否最后一页）、next_key（下一页游标），
+        数据通常在 panels/data 字段；本方法自动翻页直到 is_end=true。"""
+        token = self.get_access_token()
+        if not token:
+            return ([], '') if with_raw else []
+        if scope not in ('c2c', 'group'):
+            return ([], '') if with_raw else []
+        headers = {"Authorization": f"QQBot {token}"}
+        collected = []
+        raw_text = ''
+        next_key = ''
+        try:
+            for _page in range(1, 21):  # 最多翻 20 页，防止死循环
+                url = f"{self._get_api_base()}/v2/panels?scope={scope}"
+                # 分页参数：兼容 limit / page / next_key 三种常见风格
+                url += "&limit=100&page_size=100"
+                if next_key:
+                    url += f"&next_key={next_key}"
+                response = requests.get(url, headers=headers, timeout=30)
+                raw_text = response.text
+                if response.status_code != 200:
+                    if self.logger:
+                        self.logger.error(f"查询指令面板列表失败({scope}): {response.status_code} {raw_text}")
+                    return (collected, raw_text) if with_raw else collected
+                try:
+                    result = response.json()
+                except Exception:
+                    if self.logger:
+                        self.logger.error(f"查询指令面板列表返回非JSON({scope}): {raw_text[:500]}")
+                    return (collected, raw_text) if with_raw else collected
+                if not isinstance(result, dict):
+                    if self.logger:
+                        self.logger.warning(f"查询指令面板列表({scope})：返回非对象，原始响应: {raw_text[:500]}")
+                    return (collected, raw_text) if with_raw else collected
+                # 取出本页面板（官方字段为 records；兼容 panels/panel_list/list/data）
+                page_panels = None
+                for key in ('records', 'panels', 'panel_list', 'list'):
+                    if isinstance(result.get(key), list):
+                        page_panels = result[key]
+                        break
+                if page_panels is None:
+                    data = result.get('data')
+                    if isinstance(data, list):
+                        page_panels = data
+                    elif isinstance(data, dict):
+                        for key in ('records', 'panels', 'panel_list', 'list'):
+                            if isinstance(data.get(key), list):
+                                page_panels = data[key]
+                                break
+                if page_panels is not None:
+                    collected.extend(p for p in page_panels if isinstance(p, dict))
+                # 分页游标与结束判断
+                next_key = result.get('next_key') or (result.get('data') or {}).get('next_key') or ''
+                if result.get('is_end') or not next_key:
+                    break
+            return (collected, raw_text) if with_raw else collected
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"查询指令面板列表异常: {e}")
+            return ([], raw_text) if with_raw else []
+    
+    def delete_command_panel(self, panel_id: str) -> bool:
+        """删除指令面板（DELETE /v2/panels/{panel_id}）"""
+        token = self.get_access_token()
+        if not token:
+            return False
+        url = f"{self._get_api_base()}/v2/panels/{panel_id}"
+        headers = {"Authorization": f"QQBot {token}"}
+        try:
+            response = requests.delete(url, headers=headers, timeout=30)
+            if response.status_code in (200, 204):
+                if self.logger:
+                    self.logger.info(f"指令面板已删除: {panel_id}")
+                return True
+            else:
+                if self.logger:
+                    self.logger.error(f"删除指令面板失败: {response.status_code} {response.text}")
+                return False
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"删除指令面板异常: {e}")
             return False
     
     # ---------- 事件处理 ----------
@@ -241,6 +409,9 @@ class QQClient:
         """
         处理 Dispatch (op=0) 事件
         """
+        # 收到任何 Dispatch 事件都说明本会话已鉴权成功（IDENTIFY 或 RESUME 均会推送事件），
+        # 此时重置重连计数，避免服务器周期性 RECONNECT 后计数不断累加最终耗尽导致程序退出。
+        self._current_attempt = 0
         # 更新序列号
         if 's' in data:
             self.last_seq = data['s']
@@ -252,8 +423,6 @@ class QQClient:
         if event_type == 'READY':
             self.session_id = event_data.get('session_id')
             self._should_resume = True
-            # 鉴权成功才算真正连上，此时才重置重连计数（避免鉴权失败时无限重连）
-            self._current_attempt = 0
             # 收到服务器数据，视为连接存活
             self.last_heartbeat_ack = time.time()
             if self.logger:
@@ -327,6 +496,54 @@ class QQClient:
         except Exception as e:
             self.logger.error(f"处理WebSocket消息异常: {e}")
     
+    def _resolve_media(self, data: Dict[str, Any], scope: str = 'c2c',
+                       openid: str = '') -> List[Dict[str, Any]]:
+        """合并 QQ 事件中的富媒体附件（兼容 attachments / media 两种字段名）。
+
+        media 元素可能只有 file_info（需调接口换下载链接），这里尽量补全 url；
+        无法补全的条目保留 file_info，后续按文本描述降级处理。
+        """
+        raw = data.get('media') or data.get('attachments') or []
+        out = []
+        if not isinstance(raw, list):
+            return out
+        for m in raw:
+            if not isinstance(m, dict):
+                continue
+            item = dict(m)
+            # 没有 url 但有 file_info 时，尝试换取下载链接
+            if not item.get('url') and item.get('file_info'):
+                url = self._get_file_download_url(scope, openid, item['file_info'])
+                if url:
+                    item['url'] = url
+            out.append(item)
+        return out
+
+    def _get_file_download_url(self, scope: str, openid: str, file_info: str) -> Optional[str]:
+        """用 file_info 换取富媒体文件下载链接（QQ v2 富媒体规范）"""
+        token = self.get_access_token()
+        if not token or not openid or not file_info:
+            return None
+        try:
+            if scope == 'group':
+                url = f"{self._get_api_base()}/v2/groups/{openid}/files/{file_info}"
+            elif scope == 'c2c':
+                url = f"{self._get_api_base()}/v2/users/{openid}/files/{file_info}"
+            else:
+                url = f"{self._get_api_base()}/v2/users/{openid}/files/{file_info}"
+            headers = {"Authorization": f"QQBot {token}"}
+            response = requests.get(url, headers=headers, timeout=20)
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('url') or (result.get('data') or {}).get('url')
+            if self.logger:
+                self.logger.warning(f"获取文件下载链接失败: {response.status_code} {response.text[:200]}")
+            return None
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"获取文件下载链接异常: {e}")
+            return None
+
     def _handle_group_at_message(self, data: Dict[str, Any]):
         """处理群聊@消息"""
         if not self.message_handler:
@@ -342,7 +559,7 @@ class QQClient:
         unified_openid = author.get('user_openid') or member_openid
         user_name = author.get('username', '用户')
         msg_id = data.get('id', '')
-        attachments = data.get('attachments', [])
+        attachments = self._resolve_media(data, scope='group', openid=group_openid)
         
         message = {
             'type': 'group',
@@ -366,7 +583,7 @@ class QQClient:
         user_openid = author.get('user_openid', '')
         user_name = author.get('username', '用户')
         msg_id = data.get('id', '')
-        attachments = data.get('attachments', [])
+        attachments = self._resolve_media(data, scope='c2c', openid=user_openid)
         
         message = {
             'type': 'c2c',
@@ -389,7 +606,7 @@ class QQClient:
         user_name = author.get('username', '用户')
         msg_id = data.get('id', '')
         channel_id = data.get('channel_id', '')
-        attachments = data.get('attachments', [])
+        attachments = self._resolve_media(data, scope='c2c', openid=user_openid)
         
         message = {
             'type': 'channel',

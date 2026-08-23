@@ -19,6 +19,51 @@ class AIClient:
         self.base_url = provider_config.get('base_url', '')
         self.model = provider_config.get('model', 'gpt-3.5-turbo')
         self.file_handler = None  # 由外部注入
+        # 语音识别（ASR）配置：可与对话模型相同（OpenAI 兼容 /audio/transcriptions），也可独立
+        self.asr_base_url = (provider_config.get('asr_base_url') or '').strip()
+        self.asr_api_key = (provider_config.get('asr_api_key') or '').strip()
+        self.asr_model = provider_config.get('asr_model', 'whisper-1')
+
+    def transcribe_audio(self, audio_url: str) -> Optional[str]:
+        """语音转文字（OpenAI 兼容 ASR：POST {base}/audio/transcriptions）。
+
+        返回识别出的文字；失败返回 None。
+        """
+        if not self.file_handler:
+            if self.logger:
+                self.logger.warning("file_handler 未注入，无法下载语音")
+            return None
+        base = self.asr_base_url or self.base_url
+        api_key = self.asr_api_key or self.api_key
+        if not base or not api_key:
+            if self.logger:
+                self.logger.warning("语音识别未配置（asr_base_url / asr_api_key），无法转文字")
+            return None
+        audio_bytes = self.file_handler.download_file_to_bytes(audio_url)
+        if not audio_bytes:
+            if self.logger:
+                self.logger.warning("语音文件下载失败")
+            return None
+        # 语音文件通常没有扩展名或为 silk/amr，统一命名为 .mp3 让服务端按内容识别
+        files = {'file': ('voice.mp3', audio_bytes, 'application/octet-stream')}
+        data = {'model': self.asr_model}
+        url = f"{base.rstrip('/')}/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+            if response.status_code == 200:
+                result = response.json()
+                text = result.get('text', '').strip()
+                if self.logger:
+                    self.logger.info(f"语音识别成功: {text[:50]}...")
+                return text or None
+            if self.logger:
+                self.logger.error(f"语音识别失败: {response.status_code} {response.text[:300]}")
+            return None
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"语音识别异常: {e}")
+            return None
     
     def chat(self, messages: List[Dict[str, str]], stream: bool = False, 
              temperature: float = 0.7, max_tokens: int = 4096, retries: int = 2) -> Optional[str]:
@@ -224,3 +269,43 @@ class AIClient:
         
         filtered = re.sub(r'\n\s*\n', '\n\n', filtered)
         return filtered.strip()
+    
+    def strip_markdown(self, content: str) -> str:
+        """
+        去除AI回复中的Markdown格式符号，使内容在QQ聊天中显示更干净。
+        保留正文；只处理常见且安全的标记（加粗/行内代码/删除线/标题/列表/引用/代码块/链接/表格），
+        不处理单个 * 和 _（避免误伤"3*4"这类正常文本）。
+        表格会转换为 "单元格 | 单元格" 的纯文本行（删除分隔行）。
+        """
+        import re
+        text = content or ''
+        # 代码块：删掉围栏行，保留内部内容
+        text = re.sub(r'```[^\n]*\n?', '', text)
+        text = re.sub(r'~~~[^\n]*\n?', '', text)
+        # 行内代码 / 加粗 / 删除线
+        text = re.sub(r'`([^`\n]+)`', r'\1', text)
+        text = re.sub(r'\*\*([^*\n]+)\*\*', r'\1', text)
+        text = re.sub(r'__([^_\n]+)__', r'\1', text)
+        text = re.sub(r'~~([^~\n]+)~~', r'\1', text)
+        # 链接 [文字](url) -> 文字 (url)
+        text = re.sub(r'\[([^\]]+)\]\(([^)\s]+)\)', r'\1 (\2)', text)
+        # 行首标记：标题 / 引用 / 无序列表 / 有序列表 / 表格
+        lines = []
+        for line in text.split('\n'):
+            stripped = line.strip()
+            # 表格分隔行（仅含 | - : 空格，如 |---|---| 或 ---）：整行删除
+            if re.fullmatch(r'\|?[\s|:\-]+\|?', stripped):
+                continue
+            # 表格数据行：去掉首尾竖线，规整为 "a | b" 形式
+            if '|' in line:
+                cells = [c.strip() for c in line.strip().strip('|').split('|')]
+                line = ' | '.join(cells)
+            line = re.sub(r'^\s*#{1,6}\s*', '', line)     # 标题
+            line = re.sub(r'^\s*>\s?', '', line)          # 引用
+            line = re.sub(r'^\s*[-*+]\s+', '', line)      # 无序列表
+            line = re.sub(r'^\s*\d+[.)]\s*', '', line)    # 有序列表
+            lines.append(line)
+        text = '\n'.join(lines)
+        # 清理多余空行与首尾空白
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()

@@ -4,9 +4,21 @@
 
 import os
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Optional
+
+
+# 转移码正则：匹配 "转移码：123456" / "绑定转移码 123456" 形式的 6 位数字
+_TRANSFER_CODE_RE = re.compile(r'((?:转移码|绑定转移码)[:：]?\s*)\d{6}')
+
+
+def mask_transfer_code(text: str) -> str:
+    """日志脱敏：把消息内容中的转移码打码，避免明文落入日志"""
+    if not text:
+        return text
+    return _TRANSFER_CODE_RE.sub(r'\1******', text)
 
 
 class Logger:

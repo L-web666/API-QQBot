@@ -134,11 +134,15 @@ class ContextManager:
             }, f, ensure_ascii=False, indent=2)
     
     def create_transfer_code(self, user_openid: str, ttl: int = 600) -> str:
-        """生成6位转移码（默认10分钟有效），用于把私聊上下文绑定到群聊"""
+        """生成6位转移码（默认10分钟有效），用于把私聊上下文绑定到群聊。
+        同一用户同时最多只有一个有效码：生成新码时自动作废该用户旧的码，防止堆积。"""
         # 清理已过期的转移码，避免文件无限增长
         now = time.time()
         self.pending_codes = {c: i for c, i in self.pending_codes.items()
                               if i.get('expires', 0) > now}
+        # 同一用户只保留最新一个有效码：生成新码时自动作废该用户旧的码
+        self.pending_codes = {c: i for c, i in self.pending_codes.items()
+                              if i.get('user_openid') != user_openid}
         code = f"{random.randint(0, 999999):06d}"
         # 防重复：与当前仍未使用的转移码冲突时重新生成
         while code in self.pending_codes:

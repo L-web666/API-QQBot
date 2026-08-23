@@ -36,7 +36,7 @@ class FileHandler:
         return 'unknown'
     
     def process_attachments(self, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """处理消息附件"""
+        """处理消息附件（兼容 QQ media 数组：content_type / file_info / url）"""
         processed = []
         
         for attachment in attachments:
@@ -44,26 +44,57 @@ class FileHandler:
                 'url': attachment.get('url', ''),
                 'filename': attachment.get('filename', ''),
                 'size': attachment.get('size', 0),
-                'type': 'unknown'
+                'type': 'unknown',
+                'file_info': attachment.get('file_info', ''),
             }
             
-            # 判断文件类型
-            if 'width' in attachment and 'height' in attachment:
-                file_info['type'] = 'image'
-            elif 'duration' in attachment:
-                file_info['type'] = 'video' if 'video' in attachment.get('content_type', '') else 'audio'
+            # 优先用 content_type 判断（QQ 富媒体 media 元素携带，如 image/jpeg、audio/silk）
+            content_type = attachment.get('content_type', '') or ''
+            if content_type:
+                if content_type.startswith('image/'):
+                    file_info['type'] = 'image'
+                elif content_type.startswith('audio/'):
+                    file_info['type'] = 'audio'
+                elif content_type.startswith('video/'):
+                    file_info['type'] = 'video'
+                elif content_type in ('application/pdf', 'text/plain', 'application/json',
+                                      'text/markdown', 'text/html', 'application/msword',
+                                      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'):
+                    file_info['type'] = 'document'
             else:
-                file_info['type'] = self.get_file_type(attachment.get('filename', ''))
+                # 回退：按字段/扩展名判断
+                if 'width' in attachment and 'height' in attachment:
+                    file_info['type'] = 'image'
+                elif 'duration' in attachment:
+                    file_info['type'] = 'video' if 'video' in content_type else 'audio'
+                else:
+                    file_info['type'] = self.get_file_type(attachment.get('filename', ''))
             
             # 对于图片，添加尺寸信息
             if 'width' in attachment:
                 file_info['width'] = attachment['width']
             if 'height' in attachment:
                 file_info['height'] = attachment['height']
+            if 'duration' in attachment:
+                file_info['duration'] = attachment['duration']
             
             processed.append(file_info)
         
         return processed
+    
+    def download_file_to_bytes(self, url: str) -> Optional[bytes]:
+        """下载文件，返回原始字节（失败返回 None）"""
+        try:
+            response = requests.get(url, timeout=60)
+            if response.status_code == 200:
+                return response.content
+            if self.logger:
+                self.logger.error(f"文件下载失败: {response.status_code}")
+            return None
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"文件下载异常: {e}")
+            return None
     
     def download_file(self, url: str, save_path: str) -> bool:
         """下载文件到本地"""
