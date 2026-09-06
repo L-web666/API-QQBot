@@ -19,12 +19,11 @@
 
 ## 🚀 快速开始
 
-1. 复制配置模板：`cp config.json.example config.json`
-2. 编辑 `config.json`：
+1. 编辑 `config.json`：
    - `qq.app_id` / `qq.app_secret`：QQ 开放平台机器人凭据（未开通请先申请）
    - `api_key` / `base_url` / `model`：AI 服务配置（OpenAI 兼容接口）
    - `qq.sandbox`：`true` 为沙箱测试环境，正式运行请保持 `false`
-3. 运行：`python qqbot.py`
+2. 运行：`python qqbot.py`
 
 > 首次运行会自动创建 `config.json` 和 `data/` 目录。日志位于 `data/logs/`。
 
