@@ -9,7 +9,7 @@
 当前版本：**v1.4.0**（变更见 [CHANGELOG.md](CHANGELOG.md)，流程图见 [docs/](docs/)）
 
 **如果你是从**`QQ-Bot`**这个项目中迁移过来的，请启用该仓库内的**`plugins/ollama.py`**插件**  
-详细操作方法请见该项目目录中的`date/plugins_date/ollama/ollama配置说明.txt`
+详细操作方法请在该插件运行后查看该项目目录中的`date/plugins_date/ollama/ollama配置说明.txt`
 
 ---
 
