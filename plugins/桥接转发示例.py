@@ -24,7 +24,7 @@ PLUGIN = {
     "name": "桥接转发示例",
     "description": "演示连接型插件：消息转发到 Webhook + 后台定时主动推送",
     "version": "1.0.0",
-    "author": "你",
+    "author": "L-web666",
 }
 
 # ====== 配置（改成你自己的） ======

@@ -46,7 +46,7 @@ def on_message(msg):
 ### 一、回复型插件（给用户回复内容）
 
 ```python
-PLUGIN = {"name": "我的功能", "description": "说明", "version": "1.0.0", "author": "你"}
+PLUGIN = {"name": "我的功能", "description": "说明", "version": "1.0.0", "author": "L-web666"}
 
 COMMANDS = ["/天气"]              # 消息等于它、或 "/天气 北京" 这种带参数
 KEYWORDS = ["天气"]               # 消息包含它就触发
@@ -70,7 +70,7 @@ def on_message(msg):
 监听外部事件等。写法：`on_message` 带第二个参数 `bot`，再可选加 `on_start/on_stop`。
 
 ```python
-PLUGIN = {"name": "桥接", "description": "...", "version": "1.0.0", "author": "你"}
+PLUGIN = {"name": "桥接", "description": "...", "version": "1.0.0", "author": "L-web666"}
 
 def on_message(msg, bot):
     # bot 提供：
@@ -132,6 +132,43 @@ def _save(data):
 ```
 
 > 数据放在 `data/` 下可随程序自动备份、不会混进插件目录；各插件按名隔离，互不覆盖。
+
+## 可配置插件：把设置放进 JSON 文件（推荐做法）
+
+如果插件有"用户需要改的设置"（地址、模型名、开关、超时…），**不要写死在代码里**，
+按下面的约定放进 `DATA_DIR` 下的一个 JSON 文件，体验最好：
+
+1. **首次运行自动生成**配置 JSON（文件不存在就写一份带默认值的）
+2. 同时在**同一个目录**自动生成这份 JSON 的**说明文件**（`.txt`，逐项解释怎么填）
+3. 插件加载/启动时用 `bot.log(...)` **在控制台打印这两个文件的完整路径**，用户一看就知道去哪改
+4. 支持**保存即生效**：用文件修改时间判断配置有没有变，变了就重新读（不用重启机器人）
+5. JSON 写坏了也不能让插件崩：捕获 `ValueError`/`OSError`，本次用默认值并 `bot.error(...)` 提示
+
+```python
+# DATA_DIR 由系统注入；单独调试时用下面的兜底路径
+CONFIG_DIR = globals().get('DATA_DIR') or os.path.join('data', 'plugins_data', '我的插件')
+CONFIG_FILE = os.path.join(CONFIG_DIR, '我的插件.json')
+DOC_FILE = os.path.join(CONFIG_DIR, '我的插件配置说明.txt')
+
+def _ensure_files():
+    """首次运行：生成配置 JSON + 同目录的说明文件"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"开关": True, "超时": 30}, f, ensure_ascii=False, indent=2)
+    if not os.path.exists(DOC_FILE):
+        with open(DOC_FILE, 'w', encoding='utf-8') as f:
+            f.write("开关：true=启用，false=关闭\n超时：单位秒\n")
+
+def on_start(bot):
+    _ensure_files()
+    bot.log(f"我的插件：配置文件 → {os.path.abspath(CONFIG_FILE)}")
+    bot.log(f"我的插件：配置说明 → {os.path.abspath(DOC_FILE)}")
+```
+
+> 现成范例：`ollama.py`（配置文件 `data/plugins_data/ollama/ollama.json` + 同目录
+> `ollama配置说明.txt`，支持热加载与环境变量覆盖）、`每日签到.py`（`DATA_DIR/lottery.json`）。
+> 配置优先级建议：**环境变量 > JSON 文件 > 代码内置默认值**（方便 Docker / Ubuntu 部署时用环境变量覆盖）。
 
 ## 小技巧
 

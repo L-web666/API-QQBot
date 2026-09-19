@@ -10,7 +10,7 @@ PLUGIN = {
     "name": "骰子",
     "description": "/骰子 掷一个骰子",
     "version": "2.0.0",
-    "author": "你",
+    "author": "L-web666",
 }
 
 COMMANDS = ["/骰子"]

@@ -13,7 +13,7 @@ PLUGIN = {
     "name": "多文件插件示例",
     "description": "演示一个插件由多个 .py 文件组成：入口 __init__.py + 辅助模块 helper.py",
     "version": "1.0.0",
-    "author": "你",
+    "author": "L-web666",
 }
 
 COMMANDS = ["/计算"]

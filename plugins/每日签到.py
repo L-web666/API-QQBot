@@ -25,7 +25,7 @@ PLUGIN = {
     "name": "每日签到",
     "description": "/签到 领积分（今日第几个）、/积分 查询、/抽奖 趣味抽奖（奖项概率可配置）",
     "version": "6.0.0",
-    "author": "你",
+    "author": "L-web666",
 }
 
 COMMANDS = ["/签到", "/积分", "/抽奖"]
