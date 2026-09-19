@@ -238,4 +238,4 @@ python -m PyInstaller --noconfirm --clean --name QQAIbot --onedir qqbot_single.p
 
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)　·　版本说明：[RELEASE_NOTES.md](RELEASE_NOTES.md)
 - 云同步流程图：[docs/云同步流程图.svg](docs/云同步流程图.svg)
-- 部署模板（Ubuntu systemd / Docker）：[deploy/README-部署说明.md](deploy/README-部署说明.md)
+- Ollama部署模板（Ubuntu systemd / Docker）：[deploy/README-部署说明.md](deploy/README-部署说明.md)
