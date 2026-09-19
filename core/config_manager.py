@@ -24,14 +24,18 @@ class ConfigManager:
             "reconnect_interval": 10
         },
         # AI服务配置（简化）
+        # 说明：这三项可以留空/不填——程序照样能启动，插件、关键词回复、内置指令都不受影响；
+        #       只有"没有被插件接管"的普通消息才会因为缺少 AI 而无法回答。
         "api_key": "请填写你的API密钥",
         "base_url": "请填写API基础地址（如 https://api.openai.com/v1）",
         "model": "请填写模型名称（如 gpt-3.5-turbo）",
-        # 语音识别（ASR）配置：留空则语音消息无法转文字；填了才能识别语音
-        # 使用 OpenAI 兼容的 /audio/transcriptions 接口（如 OpenAI Whisper、Groq 等）
-        "asr_base_url": "",     # 语音识别服务地址，留空=用上面的 base_url；一般也留空即可
-        "asr_api_key": "",      # 语音识别密钥，留空=用上面的 api_key
-        "asr_model": "whisper-1",  # 语音识别模型名
+        # 未配置 AI 时给用户的兜底回复：留空=不回复（适合由插件完全接管回复的场景）
+        "no_ai_reply": "抱歉，我暂时没办法回答这个问题。",
+        # 内置 AI 总开关：false = 即使填了 API Key 也不用内置 AI，
+        # 普通消息完全交给插件/关键词回复处理（适合用 Ollama 等插件接管回复）
+        "ai": {
+            "enabled": True
+        },
         # AI全局人设
         "system_prompt": "你是一个智能、友好的AI助手，请用中文回复用户的问题。",
         # 消息过滤配置
@@ -70,12 +74,35 @@ class ConfigManager:
         },
         # 日志配置
         "log": {
-            "max_size_mb": 10                 # 单个日志文件最大大小（MB）
+            "max_size_mb": 10,                # 单个日志文件最大大小（MB）
+            "console_color": True             # 控制台彩色输出（时间灰、WARNING黄、ERROR红）；日志文件始终无颜色
         },
         # 配置热更新
         "hot_reload": {
             "enabled": True,                  # 是否启用配置热更新（编辑 config.json 保存后自动生效）
             "interval_seconds": 10            # 检查配置文件变化的间隔（秒）
+        },
+        # 云同步（可选）：把 data/ 下的用户数据同步到 Cloudflare D1，换服务器不丢数据
+        # 绝不上云：config.json（含密钥）、bot.lock / bot.pid；日志默认也不上云
+        "cloud_sync": {
+            "enabled": False,                 # 是否启用云同步
+            "provider": "cloudflare_d1",      # 目前支持 Cloudflare D1
+            "account_id": "",                 # Cloudflare 账户 ID
+            "database_id": "",                # D1 数据库 ID
+            "api_token": "",                  # Cloudflare API 令牌（需 D1 编辑权限）
+            "interval_seconds": 60,           # 后台同步间隔（秒）
+            "pull_on_start": True,            # 启动时先把云端数据拉回本地
+            "upload_logs": False,             # 日志是否也上云（量大，默认关闭）
+            "max_file_mb": 2,                 # 单文件超过此大小不同步
+            "tombstone_days": 30,             # 删除标记（墓碑）保留天数，0=永久保留
+            "apply_remote_deletes": True,     # 云端删除标记比本地新时，同步删除本地文件
+            "error_pause_minutes": 30,        # 同一文件连续失败3次→暂停同步多久（0=需手动恢复）
+            # 启动写缓存：第一次云同步完成前，data/ 下的改动先缓存在内存里，等云端数据
+            # 拉下来之后再落盘（避免刚启动时写的旧数据/默认值把云端数据覆盖掉）
+            "startup_buffer": True,           # 是否启用启动写缓存（不启用云同步时本项无意义）
+            "startup_buffer_minutes": 3,      # 等待首次同步的上限（分钟），超时先落盘；0=一直等
+            "startup_buffer_max_mb": 8,       # 缓存容量上限（MB），超过就立刻落盘；0=不限制
+            "startup_buffer_keep_remote": True  # 冲突时以云端为准：刚被首次同步恢复的文件，放弃启动期间的本地修改
         },
         # 管理员与告警
         "admin": {
@@ -144,9 +171,19 @@ class ConfigManager:
   api_key            : 你的API密钥
   base_url           : API基础地址（如 https://api.openai.com/v1）
   model              : 使用的模型名称（如 gpt-3.5-turbo）
-  asr_base_url       : 语音识别服务地址（可选，留空=用 base_url）
-  asr_api_key        : 语音识别密钥（可选，留空=用 api_key）
-  asr_model          : 语音识别模型（如 whisper-1）
+
+  以上三项均为可选：不填也能正常启动（插件/关键词回复/内置指令照常工作），
+  只是"没被插件接管"的普通消息无法回答，会使用 no_ai_reply 作为兜底回复。
+
+  no_ai_reply        : 未配置 AI 时给用户的兜底回复；留空=不回复
+
+【内置 AI 总开关】ai.enabled
+
+  true （默认）: 正常使用内置 AI（需填好上面三项）
+  false        : 即使填了 API Key 也不使用内置 AI，普通消息完全交给插件/关键词回复
+
+  用途：用本地 Ollama 等插件接管回复时，把它设为 false 就能保证内置 AI 不会参与回复
+  （插件本身也可能自带 FORCE 开关，两者互不影响）。
 
 【AI全局人设】system_prompt
 
@@ -203,11 +240,82 @@ class ConfigManager:
 【日志配置】log
 
   max_size_mb        : 单个日志文件最大大小（MB），超过自动分割（整数，默认10）
+  console_color      : True=控制台彩色输出（时间灰色、WARNING 黄色、ERROR 红色，正文不着色）
+                       False=纯文本；日志文件永远不带颜色（避免出现 ANSI 乱码）
+                       仅在终端下生效：重定向到文件/管道或无控制台时自动不上色
+                       也可用环境变量控制：NO_COLOR=1 强制关闭、FORCE_COLOR=1 强制开启
 
 【配置热更新】hot_reload
 
   enabled            : True=启用热更新，编辑 config.json 保存后自动生效（无需重启）
   interval_seconds   : 检查配置文件变化的间隔（秒，默认10）
+
+【云同步】cloud_sync（可选）
+
+  把 data/ 下的用户数据同步到 Cloudflare D1 云数据库，机器人换服务器后可把数据拉回来。
+
+  enabled            : True=启用云同步（默认 False）
+  provider           : cloudflare_d1（目前支持 Cloudflare D1）
+  account_id         : Cloudflare 账户 ID（控制台右侧 / URL 里可见）
+  database_id        : D1 数据库 ID（创建 D1 后可见）
+  api_token          : Cloudflare API 令牌，权限需要「D1 → 编辑」
+  interval_seconds   : 后台多久写入一次云数据库（秒，默认60）
+                       填 300 就是每 5 分钟一次；间隔 ≥60 秒时会对齐到整点倍数
+                       （300 秒 → 每小时 00/05/10… 分整），每个周期只写有改动的文件
+  pull_on_start      : True=启动时先把云端数据拉回本地（换服务器就靠这个恢复数据）
+  upload_logs        : 日志是否也上云（日志量大，默认 False）
+  max_file_mb        : 单个文件超过此大小不同步（默认2MB）
+  tombstone_days     : 删除标记（墓碑）保留天数，默认30；0=永久保留
+                       删除也会作为一条带时间戳的记录写入云端，其它服务器/新机器据此
+                       删除本地副本，且不会把已删除的数据"复活"；过期标记会自动清理
+  apply_remote_deletes : True（默认）=云端删除标记比本地文件新时，同步删除本地文件
+                       False=只记录不删本地（本地数据永不因云端删除而消失）
+  error_pause_minutes: 同一个文件连续失败 3 次（上传/下载/写入/删除）时：
+                       升级为 ERROR 并暂停云同步，单位分钟（默认30，0=只能手动恢复）
+                       暂停期间不再访问云端；到期自动恢复并重置失败计数；
+                       后台「⬆️ 立即同步一次」可强制重试（成功即恢复）
+
+  startup_buffer     : True（默认）=启用「启动写缓存」。程序刚启动到第一次云同步完成
+                       这段时间里，对 data/ 下数据文件的改动（写入/删除/改名）先记在
+                       内存里，等第一次同步把云端数据拉下来之后再写回磁盘。
+                       为什么需要：插件/核心模块启动时往往会立刻写数据文件（补默认值、
+                       整理格式），此时本地数据可能比云端旧，这些写入一旦先落盘，
+                       云同步就会认为本地更新 → 反而把云端数据覆盖掉。
+                       只影响会被同步的数据文件：日志、config.json 等不受影响。
+  startup_buffer_minutes : 等待首次同步的上限（分钟，默认3）。超时就把缓存的内容先落盘，
+                       避免数据一直不写；0=一直等到同步完成（不推荐，云端不通时会一直等）
+                       另外：云同步进入暂停状态、程序退出时，缓存内容都会立即落盘。
+  startup_buffer_max_mb : 缓存容量上限（MB，默认8）。机器人很忙时缓存可能攒下不少内容，
+                       超过上限就立刻把已缓存的内容写回磁盘并停止缓存（之后的改动直接写磁盘），
+                       避免无限占内存；0=不限制（仍有 128MB 兜底上限）。
+  startup_buffer_keep_remote : True（默认）=冲突时以云端为准：某个文件刚被第一次同步
+                       从云端恢复（说明云端版本更新），就放弃启动期间对它的本地修改，
+                       并在控制台 WARNING 里列出来；False=本地修改优先（照旧覆盖云端）
+                       注意：不启用云同步（enabled=false 或凭据不完整）时，以上三项都不生效，
+                       程序行为与没有这个功能时完全一样，也不会有任何云同步相关提示。
+
+  同步内容：user_context/**（上下文+身份绑定）、stats.json、plugins_data/**、
+            plugins_disabled.json、command_panel.json
+  永不上云：config.json（含 AppSecret/API Key）、config配置说明文件.txt、
+            data/bot.lock、data/bot.pid；日志在 upload_logs=false 时也不上云
+
+  删除机制（墓碑 tombstone）：
+    删除某个上下文（如 /clear）时，程序不是把云端记录删掉，而是写入一条"删除标记"
+    （key + 删除时间 + deleted=1）。其它服务器/新机器看到标记后会：
+      · 不再下载该文件（不会"复活"）
+      · 若本地副本更旧 → 同步删除本地副本（apply_remote_deletes=true 时）
+      · 若本地副本更新（删除后又改过）→ 保留并重新上传，覆盖掉标记
+    标记默认保留 30 天（tombstone_days），过期自动清理。
+
+  冲突规则（同一条记录，以时间戳更新的一方为准）：
+    · 云端副本更新（云端时间 > 本地文件修改时间）→ 用云端版本覆盖本地，
+      并且本轮**不上传**本地副本（避免本地旧数据把云端新数据覆盖掉），
+      控制台会 WARNING 提示"有 N 个文件的云端版本比本地新…"
+    · 本地副本更新 → 上传，覆盖云端
+    · 时间戳相同（同一毫秒）→ 以本地为准
+    判断依据是文件修改时间（毫秒级），所以请保证各台机器系统时间准确（建议开启自动校时）。
+
+  注意：同一时间只应运行一台机器人（云数据库按 key 覆盖，多台会互相打架）。
 
   可热更新的项：api_key / base_url / model、system_prompt、关键词过滤、
   max_segment_length、context(enabled/max_history)、require_mention、filter_meaningless、
@@ -323,12 +431,9 @@ class ConfigManager:
         self.save()
     
     def get_ai_config(self) -> Dict[str, str]:
-        """获取AI服务配置（简化版，含语音识别参数）"""
+        """获取AI服务配置"""
         return {
             "api_key": self.config.get("api_key", ""),
             "base_url": self.config.get("base_url", ""),
             "model": self.config.get("model", ""),
-            "asr_base_url": self.config.get("asr_base_url", ""),
-            "asr_api_key": self.config.get("asr_api_key", ""),
-            "asr_model": self.config.get("asr_model", "whisper-1"),
         }

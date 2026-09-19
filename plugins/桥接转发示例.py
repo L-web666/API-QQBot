@@ -17,6 +17,7 @@
 
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 import requests
 
 PLUGIN = {
@@ -49,7 +50,7 @@ def on_message(msg, bot):
             "user_openid": msg.get("user_openid", ""),
             "user_name": msg.get("user_name", ""),
             "group_openid": msg.get("group_openid", ""),
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
         }
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=5)
         bot.log(f"已转发到 Webhook: {resp.status_code}")

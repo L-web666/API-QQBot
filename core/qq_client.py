@@ -202,6 +202,32 @@ class QQClient:
     #   { "scope": "c2c"|"group", "target_type": "all"|"specific",
     #     "user_openids"|"group_openids": [...],   # target_type=specific 时
     #     "panel": { "items": [{"type":"command","name":..,"desc":..} | {"type":"link","name":..,"link":..}], "remark": .. } }
+
+    @staticmethod
+    def normalize_panel_items(items: list) -> list:
+        """按官方文档规范化面板 items：
+        - command 的 name 不应带开头的 '/'（用户点击后内容填入输入框，由面板名触发）
+        - name ≤ 14 字符、desc ≤ 30 字符（超出截断，避免被平台拒绝）
+        """
+        out = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            t = it.get('type', 'command')
+            name = str(it.get('name', '')).strip()
+            if t == 'command':
+                name = name[1:] if name.startswith('/') else name
+            desc = str(it.get('desc', '') or '')
+            item = {'type': t, 'name': name[:14]}
+            if t == 'link':
+                item['link'] = str(it.get('link', ''))
+            else:
+                item['desc'] = desc[:30]
+            if it.get('only_admin'):
+                item['only_admin'] = True
+            out.append(item)
+        return out
+
     def create_command_panel(self, scope: str, target_type: str, items: list,
                              remark: str = '', openids: list = None) -> Optional[str]:
         """创建指令面板，成功返回 panel_id，失败返回 None"""
@@ -213,7 +239,7 @@ class QQClient:
         data = {
             "scope": scope,
             "target_type": target_type,
-            "panel": {"items": items or []}
+            "panel": {"items": self.normalize_panel_items(items)}
         }
         if remark:
             data["panel"]["remark"] = remark
@@ -250,7 +276,7 @@ class QQClient:
         data = {
             "scope": scope,
             "target_type": target_type,
-            "panel": {"items": items or []}
+            "panel": {"items": self.normalize_panel_items(items)}
         }
         if remark:
             data["panel"]["remark"] = remark
@@ -356,8 +382,45 @@ class QQClient:
                     self.logger.error(f"删除指令面板失败: {response.status_code} {response.text}")
                 return False
         except Exception as e:
+
             if self.logger:
                 self.logger.error(f"删除指令面板异常: {e}")
+            return False
+
+    def set_panel_targets(self, panel_id: str, scope: str, openids: list,
+                          op: str = 'add') -> bool:
+        """修改指令面板关联对象（PUT /v2/panels/{panel_id}/target，op=add/del）。
+
+        官方说明：target_type=specific 的面板，关联的用户/群通过本接口增删——
+        创建/更新面板内容（POST/PUT /v2/panels）不会建立关联。group 场景用 group_openids。
+        """
+        token = self.get_access_token()
+        if not token or not panel_id:
+            return False
+        if scope not in ('c2c', 'group'):
+            return False
+        openids = [x for x in (openids or []) if x]
+        if not openids:
+            return False
+        url = f"{self._get_api_base()}/v2/panels/{panel_id}/target"
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        data = {"op": op}
+        if scope == 'group':
+            data["group_openids"] = openids
+        else:
+            data["user_openids"] = openids
+        try:
+            response = requests.put(url, headers=headers, json=data, timeout=30)
+            if response.status_code in (200, 204):
+                if self.logger:
+                    self.logger.info(f"指令面板关联{op}成功({scope}, {len(openids)} 个对象)")
+                return True
+            if self.logger:
+                self.logger.error(f"指令面板关联{op}失败({scope}): {response.status_code} {response.text}")
+            return False
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"指令面板关联{op}异常: {e}")
             return False
     
     # ---------- 事件处理 ----------
@@ -553,6 +616,10 @@ class QQClient:
         group_openid = data.get('group_openid', '')
         author = data.get('author', {})
         member_openid = author.get('member_openid', '')
+        # 诊断：打印群事件里的 openid 字段，确认面板关联需要的群标识（DEBUG 级别，仅日志文件）
+        if self.logger:
+            self.logger.debug(
+                f"群事件字段: group_openid={group_openid} author={json.dumps(author, ensure_ascii=False)[:200]}")
         # 实测（本机器人）：群聊事件 author 不含 user_openid 字段，
         # 且 member_openid 与私聊事件的 user_openid 值相同；
         # 仍保留 user_openid 优先读取，兼容平台未来行为变化（如事件携带 user_openid 或两套标识分离）

@@ -1,0 +1,62 @@
+# Ubuntu Server 部署模板：Ollama 与 QQ AI Bot 都在 Docker 容器内
+# 用法：
+#   1) 把整个项目目录放到服务器（例如 /opt/qqbot），本文件放在项目根目录下使用
+#   2) docker compose up -d
+#   3) 首次拉模型：docker exec -it ollama ollama pull qwen3:4b
+#   4) 看日志：docker compose logs -f qqbot
+# 说明：机器人直接用 python:3.12-slim 跑源码，plugins/ 会被挂载进容器，
+#       因此改插件后 docker compose restart qqbot 即可生效。
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    # 只把端口暴露给宿主机本机（安全）；若只用容器名互访，可以删掉这段
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama          # 模型数据持久化，别放容器里
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434            # 容器内必须监听 0.0.0.0 才能被访问
+      - OLLAMA_KEEP_ALIVE=30m                # 模型常驻内存，回复更快（省去反复加载）
+      # - OLLAMA_NUM_PARALLEL=1              # 内存紧张时限制并发
+      # - OLLAMA_MAX_LOADED_MODELS=1
+    # 有 NVIDIA 显卡时启用（宿主需装 nvidia-container-toolkit）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  qqbot:
+    image: python:3.12-slim
+    container_name: qqbot
+    restart: unless-stopped
+    working_dir: /app
+    depends_on:
+      - ollama
+    environment:
+      # ---- Ollama 插件：容器间用「服务名:端口」互访 ----
+      - BOT_OLLAMA_HOST=http://ollama:11434
+      - BOT_OLLAMA_MODEL=qwen3:4b
+      - BOT_OLLAMA_THINK=false
+      - BOT_OLLAMA_TIMEOUT=600
+      - BOT_OLLAMA_HISTORY=6
+      # ---- 其它 ----
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./:/app                              # config.json / plugins / data 都在这里
+    # Web 后台默认只监听 127.0.0.1:8666（容器内），需要外部访问时：
+    #   - config.json 里把 web_admin.host 改成 0.0.0.0，并设置强 token
+    #   - 再在下面打开端口映射，最好只对本机或内网开放
+    # ports:
+    #   - "127.0.0.1:8666:8666"
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt && python qqbot.py"
+
+volumes:
+  ollama_models:

@@ -19,60 +19,38 @@ class AIClient:
         self.base_url = provider_config.get('base_url', '')
         self.model = provider_config.get('model', 'gpt-3.5-turbo')
         self.file_handler = None  # 由外部注入
-        # 语音识别（ASR）配置：可与对话模型相同（OpenAI 兼容 /audio/transcriptions），也可独立
-        self.asr_base_url = (provider_config.get('asr_base_url') or '').strip()
-        self.asr_api_key = (provider_config.get('asr_api_key') or '').strip()
-        self.asr_model = provider_config.get('asr_model', 'whisper-1')
+        # enabled：总开关（config 里的 ai.enabled），false 时即使填了 Key 也不使用内置 AI
+        self.enabled = bool(provider_config.get('enabled', True))
+        # available：三项是否填全。没填也不会阻止程序启动——插件/关键词回复可以完全接管回复。
+        self.available = bool(self.api_key and self.base_url and self.model)
+        self._warned = False
 
-    def transcribe_audio(self, audio_url: str) -> Optional[str]:
-        """语音转文字（OpenAI 兼容 ASR：POST {base}/audio/transcriptions）。
+    @property
+    def usable(self) -> bool:
+        """内置 AI 是否真正可用（开关打开 且 配置齐全）"""
+        return self.enabled and self.available
 
-        返回识别出的文字；失败返回 None。
-        """
-        if not self.file_handler:
-            if self.logger:
-                self.logger.warning("file_handler 未注入，无法下载语音")
-            return None
-        base = self.asr_base_url or self.base_url
-        api_key = self.asr_api_key or self.api_key
-        if not base or not api_key:
-            if self.logger:
-                self.logger.warning("语音识别未配置（asr_base_url / asr_api_key），无法转文字")
-            return None
-        audio_bytes = self.file_handler.download_file_to_bytes(audio_url)
-        if not audio_bytes:
-            if self.logger:
-                self.logger.warning("语音文件下载失败")
-            return None
-        # 语音文件通常没有扩展名或为 silk/amr，统一命名为 .mp3 让服务端按内容识别
-        files = {'file': ('voice.mp3', audio_bytes, 'application/octet-stream')}
-        data = {'model': self.asr_model}
-        url = f"{base.rstrip('/')}/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        try:
-            response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
-            if response.status_code == 200:
-                result = response.json()
-                text = result.get('text', '').strip()
-                if self.logger:
-                    self.logger.info(f"语音识别成功: {text[:50]}...")
-                return text or None
-            if self.logger:
-                self.logger.error(f"语音识别失败: {response.status_code} {response.text[:300]}")
-            return None
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"语音识别异常: {e}")
-            return None
-    
+    def _warn_not_usable(self):
+        """内置 AI 不可用时的提示（只提示一次，避免刷日志）"""
+        if self.logger and not self._warned:
+            self._warned = True
+            if not self.enabled:
+                self.logger.warning(
+                    "内置 AI 已在配置中关闭（ai.enabled=false），本条消息不会由内置 AI 回答。"
+                    "插件/关键词回复不受影响；如需内置 AI 请在 config.json 打开 ai.enabled。")
+            else:
+                self.logger.warning(
+                    "内置 AI 未配置（api_key / base_url / model 未填全），本条消息无法回答。"
+                    "如果回复由插件接管，可忽略此提示；否则请在 config.json 里补齐。")
+
     def chat(self, messages: List[Dict[str, str]], stream: bool = False, 
              temperature: float = 0.7, max_tokens: int = 4096, retries: int = 2) -> Optional[str]:
         """
         纯文本对话（含重试）
         """
-        if not self.api_key:
-            self.logger.error("API Key未配置")
-            return "抱歉，AI服务未配置，请联系管理员。"
+        if not self.usable:
+            self._warn_not_usable()
+            return None
         
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -122,6 +100,10 @@ class AIClient:
         """
         带文件的多模态对话（优先尝试多模态，失败后降级为文本描述）
         """
+        # 内置 AI 未配置或已关闭：不下载图片、不做无谓请求，直接返回 None
+        if not self.usable:
+            self._warn_not_usable()
+            return None
         # 如果没有文件，直接调用纯文本
         if not files:
             return self.chat(messages)

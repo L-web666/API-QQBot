@@ -11,7 +11,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+from core.deferred_writes import startup_buffer_state
+
 MAX_BODY = 1024 * 1024  # POST 最大 1MB
+# 读日志时最多从文件尾部回看多少字节（日志单文件上限 10MB，整份读进内存没有必要）
+MAX_LOG_SCAN = 4 * 1024 * 1024
 
 
 def _mask_secret(value: str) -> str:
@@ -32,7 +36,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 # 敏感字段路径：面板中留空显示，留空保存=保持不变，填写新值=修改
-SECRET_PATHS = (('api_key',), ('qq', 'app_secret'), ('web_admin', 'token'))
+SECRET_PATHS = (('api_key',), ('qq', 'app_secret'), ('web_admin', 'token'),
+                ('cloud_sync', 'api_token'))
 
 
 def _blank_secrets(cfg: dict) -> dict:
@@ -96,6 +101,19 @@ def _fmt_uptime(seconds: int) -> str:
     return f"{m}分{s}秒"
 
 
+def _fmt_size(n) -> str:
+    """文件大小显示（B/KB/MB）"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return '-'
+    if n < 1024:
+        return '%d B' % n
+    if n < 1024 * 1024:
+        return '%.1f KB' % (n / 1024)
+    return '%.2f MB' % (n / 1024 / 1024)
+
+
 # 配置编辑器的展示顺序与字段说明（中文，小白友好）
 # type: text/secret/bool/number/textarea/list/kv/tasklist
 RENDER_FIELDS = {
@@ -107,9 +125,12 @@ RENDER_FIELDS = {
     'api_key': {'label': 'API 密钥', 'tip': '留空=保持不变；填写新值可修改', 'type': 'secret'},
     'base_url': {'label': 'API 地址', 'tip': '如 https://api.deepseek.com', 'type': 'text'},
     'model': {'label': '模型名称', 'tip': '如 deepseek-v4-flash', 'type': 'text'},
-    'asr_base_url': {'label': '语音识别地址(可选)', 'tip': '留空=使用上面的 API 地址；只有配置了语音识别才能把语音转成文字', 'type': 'text'},
-    'asr_api_key': {'label': '语音识别密钥(可选)', 'tip': '留空=使用上面的 API 密钥（一般留空即可）', 'type': 'secret'},
-    'asr_model': {'label': '语音识别模型', 'tip': '如 whisper-1；无语音需求可不管', 'type': 'text'},
+    'no_ai_reply': {'label': '未配置 AI 时的兜底回复',
+                    'tip': '上面三项留空时，普通消息回这句；留空=不回复（适合插件接管回复）',
+                    'type': 'text'},
+    'ai.enabled': {'label': '启用内置 AI',
+                   'tip': '关掉=即使填了 API Key 也不用内置 AI，普通消息全部交给插件/关键词回复',
+                   'type': 'bool'},
     'system_prompt': {'label': '人设内容', 'tip': 'AI 的角色设定与说话风格', 'type': 'textarea'},
     'filter.exact': {'label': '精确匹配关键词回复',
                      'tip': '消息与关键词完全一致时，直接回复内容（不消耗 AI）。点 ➕ 添加',
@@ -134,8 +155,57 @@ RENDER_FIELDS = {
     'context.enabled': {'label': '启用上下文', 'tip': '是否记住对话历史', 'type': 'bool'},
     'context.max_history': {'label': '历史条数', 'tip': '每个用户/群最多记住多少条', 'type': 'number'},
     'log.max_size_mb': {'label': '日志大小(MB)', 'tip': '单个日志文件超过此大小自动分割（改后需重启）', 'type': 'number'},
+    'log.console_color': {'label': '控制台彩色输出',
+                          'tip': '时间灰、WARNING 黄、ERROR 红（正文不着色）；日志文件始终无颜色（改后需重启）',
+                          'type': 'bool'},
     'hot_reload.enabled': {'label': '启用热更新', 'tip': '保存 config.json 后自动生效', 'type': 'bool'},
     'hot_reload.interval_seconds': {'label': '检查间隔(秒)', 'tip': '多久检查一次配置变化', 'type': 'number'},
+    'cloud_sync.enabled': {'label': '启用云同步',
+                           'tip': '把用户上下文/统计/插件数据同步到 Cloudflare D1，换服务器不丢数据（改后需重启）',
+                           'type': 'bool'},
+    'cloud_sync.account_id': {'label': 'Cloudflare 账户 ID', 'tip': 'Cloudflare 控制台右侧或网址里可见', 'type': 'text'},
+    'cloud_sync.database_id': {'label': 'D1 数据库 ID', 'tip': '创建 D1 数据库后可见', 'type': 'text'},
+    'cloud_sync.api_token': {'label': 'Cloudflare API 令牌',
+                             'tip': '权限需包含「D1 → 编辑」；留空=保持不变', 'type': 'secret'},
+    'cloud_sync.interval_seconds': {'label': '写入间隔(秒)',
+                                    'tip': '后台多久写入一次云数据库（默认60；填 300 = 每 5 分钟一次，'
+                                           '间隔≥60秒会对齐整点倍数；无改动的文件不会重复写）',
+                                    'type': 'number'},
+    'cloud_sync.pull_on_start': {'label': '启动时拉取云端数据',
+                                 'tip': '换服务器后靠它自动恢复用户数据（建议开启）', 'type': 'bool'},
+    'cloud_sync.upload_logs': {'label': '日志也上云',
+                               'tip': '日志量大，默认关闭；开启后 data/logs 也会同步', 'type': 'bool'},
+    'cloud_sync.max_file_mb': {'label': '单文件大小上限(MB)', 'tip': '超过此大小的文件不同步（默认2）', 'type': 'number'},
+    'cloud_sync.tombstone_days': {'label': '删除标记保留(天)',
+                                  'tip': '删除会写成带时间戳的“删除标记”，其它机器据此删除本地副本且不会复活；'
+                                         '标记保留天数（默认30，0=永久保留）',
+                                  'type': 'number'},
+    'cloud_sync.apply_remote_deletes': {'label': '应用云端删除（删本地）',
+                                        'tip': '开启：云端删除标记比本地文件新时，同步删除本地文件；'
+                                               '关闭：只记录不删本地（本地数据绝不因云端删除而消失）',
+                                        'type': 'bool'},
+    'cloud_sync.error_pause_minutes': {'label': '连续失败暂停(分钟)',
+                                       'tip': '同一文件连续失败 3 次 → 记 ERROR 并暂停云同步；'
+                                              '这里填自动恢复的分钟数（0=只能手动恢复，默认30）',
+                                       'type': 'number'},
+    'cloud_sync.startup_buffer': {'label': '启动写缓存',
+                                  'tip': '开启：程序刚启动到第一次云同步完成前，data/ 下的数据改动先存在内存里，'
+                                         '等云端数据拉下来之后再写盘，避免启动时写的旧数据把云端数据覆盖掉'
+                                         '（日志与 config.json 不受影响；未启用云同步时本项无意义）',
+                                  'type': 'bool'},
+    'cloud_sync.startup_buffer_minutes': {'label': '启动缓存等待上限(分钟)',
+                                          'tip': '等待首次同步的上限（默认3）：超时就把缓存内容先落盘，'
+                                                 '避免数据一直不写；0=一直等到同步完成（云端不通时会一直等）',
+                                          'type': 'number'},
+    'cloud_sync.startup_buffer_max_mb': {'label': '启动缓存容量上限(MB)',
+                                         'tip': '缓存内容超过此大小就立刻写回磁盘并停止缓存（默认8，0=不限制），'
+                                                '避免机器人很忙时缓存无限占内存；为安全起见即使填 0 也有 128MB 兜底',
+                                         'type': 'number'},
+    'cloud_sync.startup_buffer_keep_remote': {'label': '冲突时以云端为准',
+                                              'tip': '开启（默认）：某个文件刚被第一次同步从云端恢复，'
+                                                     '就放弃启动期间对它的本地修改，并在控制台 WARNING 里列出；'
+                                                     '关闭：本地修改优先（照旧覆盖云端）',
+                                              'type': 'bool'},
     'admin.openids': {'label': '管理员 openid 列表', 'tip': '每行一个 openid，点 ➕ 添加', 'type': 'list', 'item_label': 'openid'},
     'alert.enabled': {'label': '启用告警', 'tip': '出错时私聊通知主人', 'type': 'bool'},
     'alert.owner_openid': {'label': '主人 openid', 'tip': '接收错误告警的用户', 'type': 'text'},
@@ -164,8 +234,9 @@ RENDER_FIELDS = {
 RENDER_SECTIONS = [
     {'title': '🤖 QQ 机器人配置', 'tip': '改 AppID/密钥/沙箱后需要重启才能生效',
      'fields': ['qq.app_id', 'qq.app_secret', 'qq.sandbox', 'qq.reconnect_attempts', 'qq.reconnect_interval']},
-    {'title': '🧠 AI 服务配置', 'tip': '改完点保存即可生效，无需重启；语音识别留空=不识别语音',
-     'fields': ['api_key', 'base_url', 'model', 'asr_base_url', 'asr_api_key', 'asr_model']},
+    {'title': '🧠 AI 服务配置', 'tip': '改完点保存即可生效，无需重启；API 三项留空=不启用内置 AI，'
+                                     '「启用内置 AI」关掉=即使填了 Key 也不用内置 AI（插件接管回复时用）',
+     'fields': ['api_key', 'base_url', 'model', 'ai.enabled', 'no_ai_reply']},
     {'title': '📝 AI 全局人设', 'tip': '给 AI 的角色设定，保存后立即生效',
      'fields': ['system_prompt']},
     {'title': '🔑 关键词回复', 'tip': '命中关键词直接回复，不消耗 AI；左边填关键词、右边填回复，点 ➕ 添加',
@@ -175,8 +246,19 @@ RENDER_SECTIONS = [
     {'title': '🛡️ 敏感词过滤', 'tip': '命中敏感词的消息/回复自动打码或拦截', 'fields': ['sensitive_words.enabled', 'sensitive_words.list', 'sensitive_words.replacement', 'sensitive_words.block_input']},
     {'title': '📨 消息处理', 'tip': '', 'fields': ['message.max_segment_length', 'message.max_queue_size', 'message.filter_meaningless']},
     {'title': '💬 上下文', 'tip': '', 'fields': ['context.enabled', 'context.max_history']},
-    {'title': '📄 日志', 'tip': '改后需重启', 'fields': ['log.max_size_mb']},
+    {'title': '📄 日志', 'tip': '改后需重启', 'fields': ['log.max_size_mb', 'log.console_color']},
     {'title': '🔄 配置热更新', 'tip': '', 'fields': ['hot_reload.enabled', 'hot_reload.interval_seconds']},
+    {'title': '☁️ 云同步（Cloudflare D1）',
+     'tip': '把用户上下文 / 身份绑定 / 统计 / 插件数据同步到云数据库，换服务器自动恢复；'
+            'config.json 等敏感文件永不上云（改后需重启）',
+     'fields': ['cloud_sync.enabled', 'cloud_sync.account_id', 'cloud_sync.database_id',
+                'cloud_sync.api_token', 'cloud_sync.interval_seconds',
+                'cloud_sync.pull_on_start', 'cloud_sync.upload_logs', 'cloud_sync.max_file_mb',
+                'cloud_sync.tombstone_days', 'cloud_sync.apply_remote_deletes',
+                'cloud_sync.error_pause_minutes',
+                'cloud_sync.startup_buffer', 'cloud_sync.startup_buffer_minutes',
+                'cloud_sync.startup_buffer_max_mb',
+                'cloud_sync.startup_buffer_keep_remote']},
     {'title': '👑 管理员与告警', 'tip': '', 'fields': ['admin.openids', 'alert.enabled', 'alert.owner_openid']},
     {'title': '⏰ 定时任务', 'tip': '每行一个任务：时间(如 08:00)、发送到、目标ID、内容；点 ➕ 添加',
      'fields': ['schedule.enabled', 'schedule.tasks']},
@@ -275,14 +357,26 @@ button.ghost:hover{border-color:var(--primary);color:var(--primary);background:#
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
 .warn{background:linear-gradient(90deg,#fffbeb,#fffdf5);border:1px solid #f3d9a4;color:#8a5a08;
   padding:11px 15px;border-radius:11px;margin-bottom:16px;font-size:13px;line-height:1.7}
+.hint{background:linear-gradient(90deg,#f4f7ff,#fafcff);border:1px solid #dbe3f7;color:#4a5478;
+  padding:10px 14px;border-radius:11px;margin:0 0 12px;font-size:12.5px;line-height:1.75}
+.hint code{background:#eef2fd;padding:1px 5px;border-radius:5px;font-family:Consolas,monospace;font-size:12px}
+.log-head{font-size:12.5px;color:var(--muted);margin:0 0 6px;line-height:1.6;word-break:break-all}
 pre{background:linear-gradient(180deg,#111827,#0d1322);color:#d7e3f4;padding:14px 16px;border-radius:12px;
   overflow:auto;font-size:12.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all;margin:0;
   border:1px solid #1e293b;font-family:Consolas,"Courier New",monospace}
 table{border-collapse:separate;border-spacing:0;width:100%;background:#fff;font-size:13px;
   border:1px solid var(--line);border-radius:11px;overflow:hidden}
-td,th{border-bottom:1px solid var(--line);padding:9px 12px;text-align:left}
+td,th{border-bottom:1px solid var(--line);padding:9px 12px;text-align:left;
+  word-break:break-word;overflow-wrap:anywhere;vertical-align:top}
 tr:last-child td{border-bottom:none}
 th{background:linear-gradient(180deg,#f4f6fc,#eaeef9);color:#3b4466;font-weight:600;font-size:12.5px}
+/* 表格外层容器：内容太长时横向滚动，而不是撑破卡片或让文字互相盖住 */
+.tbl-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:11px}
+.tbl-wrap table{min-width:560px}
+.tbl-wrap.narrow table{min-width:0}
+td .badge{margin-left:0}
+td.cell-status,td.cell-act{white-space:nowrap}
+.nowrap{white-space:nowrap}
 tbody tr{transition:background .12s}
 tbody tr:hover{background:#f7f9ff}
 .toolbar{margin-bottom:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -312,6 +406,44 @@ select{padding:7px 10px;width:auto;min-width:110px;cursor:pointer}
 .badge.ok{background:#e9f9ef;color:#15803d}
 .badge.err{background:#fef0f0;color:#b91c1c}
 .badge.warn{background:#fffbeb;color:#b45309}
+
+/* ============ 手机端适配（<=820px） ============ */
+@media (max-width:820px){
+  header{padding:12px 14px;gap:8px}
+  header h1{font-size:16px}
+  header h1 .logo{width:26px;height:26px;border-radius:8px;font-size:14px}
+  #conn{font-size:12px;padding:4px 11px}
+  /* 导航横向滚动，避免换行挤压/遮挡 */
+  nav{padding:8px 10px;gap:6px;flex-wrap:nowrap;overflow-x:auto}
+  nav button{padding:7px 14px;font-size:12.5px;white-space:nowrap;flex:0 0 auto}
+  main{padding:12px}
+  .card{padding:14px;border-radius:12px}
+  .card h3{font-size:14px}
+  .grid{grid-template-columns:1fr;gap:9px}
+  .kv{padding:10px 12px}
+  .kv .v{font-size:13.5px}
+  .toolbar{gap:8px}
+  .toolbar > span{font-size:12px}
+  /* 表格：字号缩小 + 外层横向滚动（不再挤压重叠） */
+  table{font-size:12.5px}
+  td,th{padding:8px 9px}
+  .tbl-wrap table{min-width:520px}
+  pre{font-size:11.5px;padding:11px 12px;line-height:1.6}
+  /* 输入框字号 >=16px，避免 iOS 聚焦时页面被放大 */
+  input[type=text],input[type=number],input[type=password],textarea,select{font-size:16px}
+  button.primary{width:100%;padding:12px 18px;font-size:15px}
+  .sticky{flex-direction:column;align-items:stretch;gap:8px}
+  .sticky span{font-size:12.5px}
+  .kv-row .t-time,.kv-row .t-type{flex:1 1 43%;min-width:0}
+  .kv-row input,.kv-row select{min-width:0}
+  select{min-width:0;max-width:100%}
+}
+@media (max-width:480px){
+  .grid{grid-template-columns:1fr}
+  table{font-size:12px}
+  td,th{padding:7px 8px}
+  .tbl-wrap table{min-width:460px}
+}
 </style>
 </head>
 <body>
@@ -337,6 +469,16 @@ select{padding:7px 10px;width:auto;min-width:110px;cursor:pointer}
     <label style="margin:0"><input type="checkbox" id="auto_status" onchange="toggleAuto()"> 每 5 秒自动刷新</label>
   </div>
   <div class="card"><h3>运行状态</h3><div class="grid" id="status_grid"></div></div>
+  <div class="card"><h3>☁️ 云同步</h3>
+    <div class="toolbar">
+      <button class="ghost" onclick="syncCloudNow()">⬆️ 立即同步一次</button>
+      <button class="ghost" onclick="testCloudNow()">🔌 测试连接</button>
+      <button class="ghost" onclick="resumeCloudNow()">▶️ 解除暂停</button>
+      <span style="font-size:12.5px;color:var(--muted)">按设定间隔自动写入云数据库；没有改动的文件不会重复写；
+        同一文件连续失败 3 次会自动暂停并记 ERROR（可在此手动重试/解除）</span>
+    </div>
+    <div class="grid" id="cloud_grid"></div>
+  </div>
   <div class="card"><h3>最近日志（20 条）</h3><pre id="status_logs"></pre></div>
 </div>
 
@@ -383,19 +525,18 @@ select{padding:7px 10px;width:auto;min-width:110px;cursor:pointer}
   <div class="card">
     <h3>🧩 插件管理</h3>
     <div class="toolbar">
-      <button class="ghost" onclick="loadPlugins()">🔄 刷新列表</button>
-      <button class="ghost" onclick="reloadPlugins()">♻️ 重新加载插件（改完插件文件后点这个）</button>
-      <button class="primary" onclick="applyPlugins()">💾 保存插件设置（启用/停用后点这里生效）</button>
+      <button class="ghost" onclick="refreshPlugins()">🔄 刷新（扫描插件目录并重新加载）</button>
+      <button class="primary" id="plugins_save_btn" onclick="applyPlugins()">💾 保存（应用启用/停用修改）</button>
+      <span id="plugins_pending" style="display:none;padding:6px 12px;background:#fff7e6;border:1px solid #f5d28e;border-radius:9px;font-size:12.5px;color:#8a6d1a">
+      </span>
     </div>
     <div id="plugins_view"><p style="color:#888">加载中...</p></div>
-    <div id="plugins_pending" style="display:none;margin-top:10px;padding:9px 14px;background:#fff7e6;border:1px solid #f5d28e;border-radius:10px;font-size:12.5px;color:#8a6d1a">
-      ⚠️ 有未保存的启用/停用修改，点上方「💾 保存插件设置」才真正生效。
-    </div>
     <div style="margin-top:12px;padding:11px 14px;background:#f4f5ff;border:1px solid #d8dcf8;border-radius:10px;font-size:12.5px;color:#4a5478;line-height:1.8">
       📖 <b>怎么加插件</b>：把插件放进程序的 <code>plugins/</code> 目录——单个 <code>.py</code> 文件，
       或多个文件时用<b>一个文件夹</b>（入口 <code>__init__.py</code> 或 <code>main.py</code>，其余 .py 是辅助模块）。
-      然后点「重新加载插件」即可，<b>不用改任何源代码</b>。<br>
-      插件格式说明见 <code>plugins/README.md</code>，或参考目录里的 <code>示例插件.py</code> 和 <code>多文件示例/</code>。
+      然后点「🔄 刷新」即可，<b>不用改任何源代码</b>。<br>
+      启用/停用插件后点「💾 保存」生效；状态会保存，重启后保持。<br>
+      插件格式说明见 <code>plugins/README.md</code>，或参考目录里的示例插件。
     </div>
   </div>
 </div>
@@ -418,6 +559,18 @@ select{padding:7px 10px;width:auto;min-width:110px;cursor:pointer}
       <button class="ghost" onclick="loadLogs()">🔄 刷新</button>
       <label style="margin:0;font-size:13px;color:#3d4663"><input type="checkbox" id="auto_logs" onchange="toggleAuto()"> 每 5 秒自动刷新</label>
     </div>
+    <div class="toolbar">
+      <span style="font-size:13px;color:var(--muted)">下载日志文件：</span>
+      <select id="log_file" style="min-width:220px;max-width:100%"
+              title="这里的选择只用于下载，不会改变下方显示的内容"></select>
+      <button class="ghost" onclick="loadLogFiles()">🗂️ 刷新文件列表</button>
+      <button class="ghost" onclick="downloadLog()">⬇️ 下载选中的日志</button>
+    </div>
+    <div class="hint">
+      ℹ️ 这一行是<b>下载用</b>的：选择某个文件后点「下载选中的日志」，会把这个 <code>.txt</code> 下载到电脑上查看/转发。
+      <b>它不会改变下方显示的内容</b> —— 下方「运行日志」始终显示<b>最新</b>的那个日志文件（可用上面的「级别 / 行数」筛选）。
+    </div>
+    <div class="log-head" id="logs_current">当前显示：最新日志文件</div>
     <pre id="logs_view"></pre>
   </div>
 </div>
@@ -450,10 +603,9 @@ select{padding:7px 10px;width:auto;min-width:110px;cursor:pointer}
       <tr><td>/绑定转移码 123456</td><td>绑定身份并转移记忆（群里发）</td></tr>
     </table>
   </div>
-  <div class="card"><h3>🖼️ 图片与语音</h3>
+  <div class="card"><h3>🖼️ 图片</h3>
     <ol>
       <li><b>图片</b>：直接发图片给机器人，AI 会看图并回复（需要 AI 模型支持图片识别）</li>
-      <li><b>语音</b>：直接发语音，机器人会先转成文字再回复（需要在「配置→AI 服务」里填语音识别地址/密钥；留空则语音无法识别）</li>
     </ol>
   </div>
   <div class="card"><h3>🔑 关键词回复怎么填（示例）</h3>
@@ -513,7 +665,7 @@ function show(name){
   else if(name==='stats'){ loadStats(); }
   else if(name==='config'){ loadConfig(); }
   else if(name==='plugins'){ loadPlugins(); }
-  else if(name==='logs'){ loadLogs(); }
+  else if(name==='logs'){ loadLogs(); loadLogFiles(); }
   else if(name==='context'){ loadContext(); }
 }
 /* ---------- 状态 ---------- */
@@ -538,6 +690,42 @@ async function loadStatus(){
       ['日志文件数', s.log_count],
     ];
     grid.innerHTML = items.map(function(x){ return '<div class="kv"><div class="k">'+x[0]+'</div><div class="v">'+x[1]+'</div></div>'; }).join('');
+    var cg = document.getElementById('cloud_grid');
+    var cs = s.cloud_sync || {enabled:false, note:'未启用'};
+    var citems;
+    if(!cs.enabled){
+      citems = [['云同步', cs.note || '未启用'],
+                ['开启方式', '「配置」→「☁️ 云同步」填 Cloudflare D1 信息并启用']];
+    }else if(cs.paused){
+      citems = [
+        ['状态', '⛔ 已暂停同步（连续失败 ' + 3 + ' 次触发）'],
+        ['暂停原因', cs.pause_reason || '-'],
+        ['恢复方式', cs.resume_text || '请点「立即同步一次」或重启程序'],
+        ['失败文件', (cs.fail_files && cs.fail_files.length) ? cs.fail_files.join('、') : '-'],
+        ['自动写入间隔', cs.interval_text || (cs.interval + ' 秒')],
+      ];
+    }else{
+      citems = [
+        ['状态', '✅ 已启用'],
+        ['自动写入间隔', cs.interval_text || (cs.interval + ' 秒')],
+        ['上次写入时间', cs.last_time_text || '尚未同步'],
+        ['上次上传', cs.uploaded + ' 个文件'],
+        ['上次恢复', cs.downloaded + ' 个文件'],
+        ['上次删除标记', cs.deleted + ' 个'],
+        ['应用云端删除', (cs.applied_remote_deletes || 0) + ' 个文件'],
+        ['本地更新复活', (cs.revived || 0) + ' 个文件'],
+        ['云端较新(改用云端)', (cs.cloud_newer || 0) + ' 个文件'],
+        ['日志是否上云', cs.upload_logs ? '是' : '否（默认）'],
+      ];
+      if(cs.first_sync_done === false){
+        citems.unshift(['首次同步', '⏳ 尚未执行（数据可能不是最新，连上 QQ 后自动同步）']);
+      }
+      if(cs.startup_buffer){
+        citems.unshift(['启动写缓存', (cs.startup_buffer_text || '⏳ 缓存中') +
+          '（启动期间的数据改动等第一次同步完成后再写盘，避免覆盖云端数据）']);
+      }
+    }
+    cg.innerHTML = citems.map(function(x){ return '<div class="kv"><div class="k">'+x[0]+'</div><div class="v">'+x[1]+'</div></div>'; }).join('');
     document.getElementById('status_logs').textContent = s.recent_logs || '(无日志)';
   }catch(e){
     // 出错时直接把原因显示在徽章上，便于排查
@@ -545,6 +733,35 @@ async function loadStatus(){
     c.className = 'off';
     msg('状态加载失败: '+e.message, false);
   }
+}
+async function syncCloudNow(){
+  try{
+    var r = await fetch(url('/api/cloud_sync/sync'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    var res = await r.json();
+    if(res.ok){
+      var x = res.result || {};
+      msg('☁️ 同步完成：上传 ' + (x.uploaded||0) + ' 个，恢复 ' + (x.downloaded||0) + ' 个，删除 ' + (x.deleted||0) + ' 个', true);
+    }else{
+      msg('❌ 同步失败: ' + (res.message||''), false);
+    }
+    loadStatus();
+  }catch(e){ msg('同步失败: '+e.message, false); }
+}
+async function testCloudNow(){
+  // 用「配置 → 云同步」里已保存的账户 ID / 数据库 ID / API 令牌测一次连接
+  try{
+    var r = await fetch(url('/api/cloud_sync/test'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    var res = await r.json();
+    msg((res.ok ? '✅ ' : '❌ ') + (res.message || ''), !!res.ok);
+  }catch(e){ msg('测试失败: '+e.message, false); }
+}
+async function resumeCloudNow(){
+  try{
+    var r = await fetch(url('/api/cloud_sync/resume'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    var res = await r.json();
+    msg((res.ok ? '▶️ ' : '❌ ') + (res.message || ''), !!res.ok);
+    loadStatus();
+  }catch(e){ msg('解除暂停失败: '+e.message, false); }
 }
 /* ---------- 统计 ---------- */
 var STAT_LABELS = {
@@ -590,22 +807,28 @@ async function loadStats(){
   }catch(e){ msg('统计加载失败: '+e.message, false); }
 }
 /* ---------- 插件 ---------- */
-var PLUGIN_CHANGES = {};   // 暂存的修改：name -> disabled(布尔)
+var PLUGIN_CHANGES = {};        // 暂存的修改：name -> 目标 disabled(布尔)
+var PLUGIN_SERVER_STATE = {};   // 服务器上真实的 disabled 状态（判断是否属于“取消修改”）
 async function loadPlugins(){
   var v = document.getElementById('plugins_view');
   v.innerHTML = '加载中...';
   try{
     var data = await getJSON('/api/plugins');
     var list = data.plugins || [];
-    // 用暂存修改覆盖显示的启用/停用状态
-    list.forEach(function(p){ if(p.name in PLUGIN_CHANGES) p.disabled = PLUGIN_CHANGES[p.name]; });
+    // 先记录服务器真实状态，再用暂存修改覆盖显示，并标记“待保存”
+    PLUGIN_SERVER_STATE = {};
+    list.forEach(function(p){ PLUGIN_SERVER_STATE[p.name] = !!p.disabled; });
+    list.forEach(function(p){
+      p._staged = (p.name in PLUGIN_CHANGES);
+      if(p._staged){ p.disabled = PLUGIN_CHANGES[p.name]; }
+    });
     updatePluginsPending();
     if(!list.length){
       v.innerHTML = '<p style="color:#888">暂无插件（把插件放进 plugins/ 目录后点「重新加载」）</p>';
       return;
     }
-    v.innerHTML = '<table style="table-layout:fixed"><colgroup>' +
-        '<col style="width:18%"><col style="width:34%"><col style="width:9%"><col style="width:17%"><col style="width:9%"><col style="width:13%">' +
+    v.innerHTML = '<div class="tbl-wrap"><table style="table-layout:fixed"><colgroup>' +
+        '<col style="width:20%"><col style="width:28%"><col style="width:9%"><col style="width:16%"><col style="width:11%"><col style="width:16%">' +
         '</colgroup><tr><th>插件名</th><th>说明</th><th>类型</th><th>匹配规则</th><th>状态</th><th>操作</th></tr>' +
       list.map(function(p){
         var rules = [];
@@ -613,32 +836,57 @@ async function loadPlugins(){
         if(p.keywords && p.keywords.length) rules.push('关键词: ' + p.keywords.join(', '));
         if(p.match_custom) rules.push('自定义 match');
         var kind = (p.kind === 'dir') ? '<span class="badge warn">多文件</span>' : '<span class="badge">单文件</span>';
-        var badge = p.disabled
-          ? '<span class="badge err">已停用</span>'
-          : '<span class="badge ok">运行中</span>';
+        // 有未保存修改时只显示一个“待启用/待停用”徽章：两个徽章并排会超出状态列，
+        // 溢出后被右侧“启用/停用”按钮盖住，看起来像被遮挡。
+        var badge = p._staged
+          ? '<span class="badge warn" title="修改尚未保存，点上方「💾 保存」后生效">' +
+            (p.disabled ? '待停用' : '待启用') + '</span>'
+          : (p.disabled ? '<span class="badge err">已停用</span>'
+                        : '<span class="badge ok">运行中</span>');
+        var rowstyle = p._staged ? ' style="background:#fffdf3"' : '';
         var btn = p.disabled
           ? '<button class="ghost" data-pname="'+esc(p.name)+'" onclick="togglePlugin(this, false)">▶️ 启用</button>'
           : '<button class="ghost" data-pname="'+esc(p.name)+'" onclick="togglePlugin(this, true)">⏸️ 停用</button>';
-        return '<tr><td>'+esc(p.title)+' <span style="color:#999;font-size:11px">('+esc(p.file)+')</span></td>'+
-          '<td style="word-break:break-all">'+esc(p.description||'-')+'</td>'+
-          '<td style="white-space:nowrap">'+kind+'</td>'+
-          '<td style="word-break:break-all">'+esc(rules.join('<br>')||'-')+'</td>'+
-          '<td style="white-space:nowrap">'+badge+'</td><td style="white-space:nowrap">'+btn+'</td></tr>';
-      }).join('') + '</table>';
+        // 固定列宽 + 任意位置换行：长插件名/说明会在单元格内换行，不再溢出去压到旁边的列
+        return '<tr'+rowstyle+'>' +
+          '<td style="word-break:break-all;overflow-wrap:anywhere">'+esc(p.title)+
+            ' <span style="color:#999;font-size:11px">('+esc(p.file)+')</span></td>'+
+          '<td style="word-break:break-all;overflow-wrap:anywhere">'+esc(p.description||'-')+'</td>'+
+          '<td class="cell-status">'+kind+'</td>'+
+          '<td style="word-break:break-all;overflow-wrap:anywhere">'+esc(rules.join('; ')||'-')+'</td>'+
+          '<td class="cell-status">'+badge+'</td>'+
+          '<td class="cell-act">'+btn+'</td></tr>';
+      }).join('') + '</table></div>';
   }catch(e){ v.innerHTML = '<p class="error">加载失败: '+e.message+'</p>'; }
 }
 function updatePluginsPending(){
   var n = Object.keys(PLUGIN_CHANGES).length;
-  document.getElementById('plugins_pending').style.display = n ? 'block' : 'none';
+  var tip = document.getElementById('plugins_pending');
+  if(tip){
+    tip.style.display = n ? 'inline-block' : 'none';
+    tip.textContent = n ? ('⚠️ 有 ' + n + ' 项修改待保存，点左边「💾 保存」生效') : '';
+  }
+  var b = document.getElementById('plugins_save_btn');
+  if(b){
+    b.textContent = n ? ('💾 保存（' + n + ' 项待应用）') : '💾 保存（应用启用/停用修改）';
+    b.style.boxShadow = n ? '0 0 0 3px rgba(245,210,142,.6)' : '';
+  }
 }
 function togglePlugin(btn, disabled){
-  // 只暂存修改，不立即生效（点「保存插件设置」后才应用）
+  // 只暂存修改，点「💾 保存」后才真正生效。
+  // 关键：必须以「服务器真实状态」为基准判断，否则对已停用的插件点「启用」会被
+  // 当成“取消修改”而立刻弹回原状，看起来像点了没反应。
   var name = btn.getAttribute('data-pname');
-  if(!name) return;
-  if(disabled){
-    PLUGIN_CHANGES[name] = true;
+  if(!name){ return; }
+  var base = !!PLUGIN_SERVER_STATE[name];
+  if(disabled === base){
+    delete PLUGIN_CHANGES[name];        // 目标与服务器当前一致 → 取消这条修改
   } else {
-    delete PLUGIN_CHANGES[name];  // 恢复原状
+    PLUGIN_CHANGES[name] = disabled;    // 暂存目标状态（启用=false / 停用=true）
+  }
+  var n = Object.keys(PLUGIN_CHANGES).length;
+  if(typeof msg === 'function'){
+    msg(n ? ('已暂存修改（共 ' + n + ' 项），点「💾 保存」后生效') : '已取消未保存的修改', true);
   }
   loadPlugins();
 }
@@ -658,13 +906,16 @@ async function applyPlugins(){
     loadPlugins();
   }catch(e){ msg('保存失败: '+e.message, false); }
 }
-async function reloadPlugins(){
+async function refreshPlugins(){
+  // 刷新 = 清掉暂存的启用/停用修改 + 重新扫描插件目录并加载
+  PLUGIN_CHANGES = {};
+  updatePluginsPending();
   try{
     var r = await fetch(url('/api/plugins/reload'), {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
     var res = await r.json();
-    msg(res.ok ? ('✅ 已重新加载，共 ' + (res.count||0) + ' 个插件') : ('❌ 重载失败: ' + (res.message||'')), res.ok);
+    msg(res.ok ? ('🔄 已刷新，共 ' + (res.count||0) + ' 个插件') : ('❌ 刷新失败: ' + (res.message||'')), res.ok);
     loadPlugins();
-  }catch(e){ msg('重载失败: '+e.message, false); }
+  }catch(e){ msg('刷新失败: '+e.message, false); }
 }
 /* ---------- 配置 ---------- */
 var CONFIG_SPEC = null;
@@ -858,6 +1109,35 @@ async function loadLogs(){
     view.textContent = text.trim() ? text : '(该级别暂无日志)';
   }catch(e){ msg('日志加载失败: '+e.message, false); }
 }
+async function loadLogFiles(){
+  try{
+    var d = await getJSON('/api/logs/list');
+    var sel = document.getElementById('log_file');
+    var files = d.files || [];
+    var keep = sel.value;
+    sel.innerHTML = files.length
+      ? files.map(function(f){
+          return '<option value="'+esc(f.name)+'">'+esc(f.name)+'（'+esc(f.size_text||'')+'）</option>';
+        }).join('')
+      : '<option value="">（暂无日志文件）</option>';
+    if(keep && files.some(function(f){ return f.name === keep; })) sel.value = keep;
+    // 明确写出"下方显示的是最新日志"，避免误以为切换下拉会改变这里的内容
+    var head = document.getElementById('logs_current');
+    if(head){
+      head.innerHTML = files.length
+        ? ('当前显示：<b>最新</b>日志文件 <b>' + esc(d.current || files[0].name) + '</b>' +
+           '（共 ' + files.length + ' 个；上方下拉仅用于下载，不影响这里）')
+        : '当前显示：暂无日志文件';
+    }
+  }catch(e){ /* 文件列表失败不影响看日志 */ }
+}
+function downloadLog(){
+  var sel = document.getElementById('log_file');
+  var name = sel ? sel.value : '';
+  if(!name){ msg('请先选择一个日志文件', false); return; }
+  msg('开始下载 ' + name + '（页面下方显示的内容不受影响）…', true);
+  window.location.href = url('/api/logs/download?name=' + encodeURIComponent(name));
+}
 /* ---------- 上下文 ---------- */
 async function loadContext(){
   try{
@@ -869,8 +1149,16 @@ async function loadContext(){
 }
 function tableHTML(rows){
   if(!rows.length) return '<p style="color:#888">暂无文件</p>';
-  return '<table><tr><th>文件</th><th>消息条数</th><th>大小</th><th>最后修改</th></tr>' +
-    rows.map(function(r){ return '<tr><td>'+r.name+'</td><td>'+r.entries+'</td><td>'+r.size+'</td><td>'+r.mtime+'</td></tr>'; }).join('') + '</table>';
+  // 文件名（openid）很长且没有空格，必须允许任意位置换行，否则会超出卡片；
+  // 外层 .tbl-wrap 负责在屏幕很窄时横向滚动，避免挤压变形。
+  return '<div class="tbl-wrap"><table><tr><th style="width:46%">文件</th>' +
+    '<th style="width:16%">消息条数</th><th style="width:18%">大小</th><th style="width:20%">最后修改</th></tr>' +
+    rows.map(function(r){
+      return '<tr>' +
+        '<td style="word-break:break-all;overflow-wrap:anywhere;font-size:12.5px">'+esc(r.name)+'</td>' +
+        '<td>'+esc(r.entries)+'</td><td class="nowrap">'+esc(r.size)+'</td><td class="nowrap">'+esc(r.mtime)+'</td>' +
+        '</tr>';
+    }).join('') + '</table></div>';
 }
 /* ---------- 指令面板管理 ---------- */
 async function loadPanels(){
@@ -889,14 +1177,18 @@ async function loadPanels(){
       v.innerHTML = '<p style="color:#888">暂无指令面板（或未开通权限）</p>' + d;
       return;
     }
-    v.innerHTML = '<table><tr><th>生效场景</th><th>面板ID</th><th>备注/内容</th><th>操作</th></tr>' +
+    v.innerHTML = '<div class="tbl-wrap"><table><tr><th style="width:14%">生效场景</th>' +
+      '<th style="width:34%">面板ID</th><th style="width:38%">备注/内容</th><th style="width:14%">操作</th></tr>' +
       list.map(function(p){
         var id = p.panel_id || p.id || '';
         var sc = (p.scope === 'group') ? '群聊' : ((p.scope === 'c2c') ? '私聊' : (p.scope || '?'));
         var meta = p.remark || (p.panel && p.panel.remark) || JSON.stringify(p).substring(0, 60);
-        return '<tr data-pid="'+esc(id)+'"><td>'+esc(sc)+'</td><td>'+esc(id)+'</td><td>'+esc(meta)+'</td>'+
-          '<td><button class="row-del" onclick="delPanelRow(this)">删除</button></td></tr>';
-      }).join('') + '</table>';
+        return '<tr data-pid="'+esc(id)+'">' +
+          '<td class="nowrap">'+esc(sc)+'</td>' +
+          '<td style="word-break:break-all;overflow-wrap:anywhere">'+esc(id)+'</td>' +
+          '<td style="word-break:break-all;overflow-wrap:anywhere">'+esc(meta)+'</td>' +
+          '<td class="nowrap"><button class="row-del" onclick="delPanelRow(this)">删除</button></td></tr>';
+      }).join('') + '</table></div>';
   }catch(e){ v.innerHTML = '<p class="error">加载失败: '+e.message+'</p>'; }
 }
 function delPanelRow(btn){
@@ -990,12 +1282,71 @@ class WebAdmin:
             'ctx_group': len(ctx.get('group', [])),
             'log_count': self._log_count(),
             'recent_logs': recent_logs,
+            'cloud_sync': self.get_cloud_sync_status(),
+        }
+
+    def get_cloud_sync_status(self) -> dict:
+        """云同步状态（供状态页展示：上次写入时间、本次上传/恢复/删除数量）"""
+        cs = getattr(self.hub, 'cloud_sync', None)
+        if cs is None:
+            cs_cfg = (self.hub.config or {}).get('cloud_sync') or {}
+            if not cs_cfg.get('enabled'):
+                return {'enabled': False, 'note': '未启用'}
+            return {'enabled': False, 'note': '已启用但配置不完整（account_id / database_id / api_token）'}
+        res = dict(getattr(cs, 'last_result', {}) or {})
+        ts = res.get('time')
+        pause = {}
+        try:
+            pause = cs.pause_info()
+        except Exception:
+            pause = {}
+        try:
+            buf = startup_buffer_state()
+        except Exception:
+            buf = {}                       # 启动写缓存状态（首次同步完成前才有内容）
+        return {
+            'enabled': True,
+            'interval': cs.interval,
+            'interval_text': ('%d 秒（对齐整点倍数）' % cs.interval) if cs.interval >= 60
+                             else ('%d 秒' % cs.interval),
+            'uploaded': int(res.get('uploaded', 0)),
+            'downloaded': int(res.get('downloaded', 0)),
+            'deleted': int(res.get('deleted', 0)),
+            'applied_remote_deletes': int(res.get('applied_remote_deletes', 0)),
+            'revived': int(res.get('revived', 0)),
+            'cloud_newer': int(res.get('cloud_newer', 0)),
+            'skipped': int(res.get('skipped', 0)),
+            'errors': int(res.get('errors', 0)),
+            'first_sync_done': bool(getattr(cs, 'first_sync_done', True)),
+            'first_sync_hint': ('尚未执行首次同步：刚启动的这段时间数据可能不是最新的，'
+                                '成功连接 QQ 后会自动同步'),
+            'startup_buffer': bool(buf.get('active')),
+            'startup_buffer_text': ('⏳ 缓存中：%d 个文件改动还没落盘（%s / 上限 %s，等第一次同步完成）'
+                                    % (int(buf.get('files', 0)), buf.get('size_text', '0 字节'),
+                                       buf.get('max_text', '不限制'))) if buf.get('active') else '',
+            'paused': bool(pause.get('paused')),
+            'pause_reason': pause.get('reason', ''),
+            'resume_text': pause.get('resume_text', ''),
+            'fail_files': pause.get('fail_files', []),
+            'last_time': ts,
+            'last_time_text': (time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts + 8 * 3600))
+                               if ts else ''),
+            'upload_logs': bool(getattr(cs, 'upload_logs', False)),
         }
 
     def get_config(self) -> dict:
-        """返回配置 + 编辑器渲染信息（敏感字段置空，不显示真实密钥）"""
+        """返回配置 + 编辑器渲染信息（敏感字段置空，不显示真实密钥）
+
+        先用默认值补齐缺失项再交给页面：否则"配置里没有这个键"（例如升级后新增的
+        选项）会显示成关闭/空值，用户一保存就把默认值写成了 false/0，功能被意外关掉。
+        """
+        try:
+            live = self.hub.config_manager.config or {}
+            cfg = _deep_merge(self.hub.config_manager.DEFAULT_CONFIG, live)
+        except Exception:
+            cfg = self.hub.config_manager.config
         return {
-            'config': _blank_secrets(self.hub.config_manager.config),
+            'config': _blank_secrets(cfg),
             'sections': RENDER_SECTIONS,
             'fields': RENDER_FIELDS,
         }
@@ -1021,17 +1372,69 @@ class WebAdmin:
             return {'ok': False, 'message': f'写入 config.json 失败: {e}'}
         # 热应用
         try:
-            changed = self.hub._apply_hot_config()
+            changed = self.hub._apply_hot_config(source='Web后台')
         except Exception as e:
             changed = None
         hot = (', '.join(changed) if changed else '无热更新项') if changed is not None else '（应用异常）'
         return {'ok': True, 'message': f'保存成功，已热应用: {hot}。连接类配置（AppID/密钥/沙箱等）需重启生效。'}
 
+    def list_log_files(self) -> list:
+        """列出 data/logs 下的日志文件（按时间倒序，新的在前）"""
+        d = os.path.join('data', 'logs')
+        out = []
+        try:
+            for fn in os.listdir(d):
+                if not fn.endswith('.txt'):
+                    continue
+                full = os.path.join(d, fn)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                out.append({
+                    'name': fn,
+                    'size': int(st.st_size),
+                    'size_text': _fmt_size(st.st_size),
+                    'mtime': int(st.st_mtime),
+                    'mtime_text': time.strftime('%Y-%m-%d %H:%M:%S',
+                                                time.gmtime(st.st_mtime + 8 * 3600)),
+                })
+        except Exception:
+            pass
+        # 按修改时间倒序；同一秒内创建的再按文件名倒序（文件名里就是时间戳）保证顺序稳定
+        out.sort(key=lambda x: (x['mtime'], x['name']), reverse=True)
+        return out
+
+    def log_file_path(self, name: str):
+        """把前端传来的日志文件名解析成安全路径（拦住目录穿越/非 .txt）"""
+        name = (name or '').strip()
+        if not name or not name.endswith('.txt'):
+            return None
+        if name != os.path.basename(name) or '/' in name or '\\' in name or name.startswith('.'):
+            return None
+        full = os.path.join('data', 'logs', name)
+        return full if os.path.isfile(full) else None
+
+    def read_log_file(self, name: str):
+        """读取指定日志文件内容（返回 (文件名, bytes) 或 (None, None)）"""
+        full = self.log_file_path(name)
+        if not full:
+            return None, None
+        try:
+            with open(full, 'rb') as f:
+                return os.path.basename(full), f.read()
+        except Exception:
+            return None, None
+
     def get_logs(self, lines: int = 100, level: str = '') -> list:
         """读取最新日志文件（只认 .txt，避免把 logs 目录里的图片等文件当文本读）。
 
         level 可选：DEBUG / INFO / WARNING / ERROR / CRITICAL（留空 = 全部）。
-        按级别过滤时，返回最近 lines 条匹配该级别的日志行。"""
+        按级别过滤时，返回最近 lines 条匹配该级别的日志行。
+
+        ⚠️ 返回值里每行都**带结尾换行符**（和 readlines() 一致）——调用方直接用
+        ''.join(...) 拼成文本即可；不要去掉换行符，否则页面上的日志会挤成一行。
+        """
         log_dir = os.path.join('data', 'logs')
         try:
             files = sorted(f for f in os.listdir(log_dir) if f.endswith('.txt'))
@@ -1040,15 +1443,32 @@ class WebAdmin:
         if not files:
             return []
         newest = os.path.join(log_dir, files[-1])
+        limit = max(1, min(int(lines), 500))
+        marker = f" - {level} - " if level else ''
         try:
-            with open(newest, 'r', encoding='utf-8', errors='replace') as f:
-                all_lines = f.readlines()
-            limit = max(1, min(int(lines), 500))
-            if level:
-                marker = f" - {level} - "
-                matched = [ln for ln in all_lines if marker in ln]
-                return matched[-limit:]
-            return all_lines[-limit:]
+            # 从文件尾部往前逐块读取（最多回看 MAX_LOG_SCAN）：
+            # 状态页每 5 秒刷新一次，把整份日志（最大 10MB）读进内存没有必要，也浪费内存。
+            out = []                       # 按"新 → 旧"收集
+            with open(newest, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                scanned = 0
+                while pos > 0 and scanned < MAX_LOG_SCAN and len(out) < limit:
+                    size = int(min(64 * 1024, pos, MAX_LOG_SCAN - scanned))
+                    pos -= size
+                    f.seek(pos)
+                    chunk = f.read(size).decode('utf-8', errors='replace')
+                    scanned += size
+                    chunk_lines = chunk.splitlines()
+                    if pos > 0 and chunk_lines:
+                        chunk_lines = chunk_lines[1:]     # 块首可能是半行，丢掉
+                    for ln in reversed(chunk_lines):
+                        if marker and marker not in ln:
+                            continue
+                        out.append(ln + '\n')      # 调用方用 ''.join() 拼接，必须带换行
+                        if len(out) >= limit:
+                            break
+            return list(reversed(out))
         except Exception:
             return []
 
@@ -1136,11 +1556,14 @@ class WebAdmin:
             def log_message(self, *args):
                 pass
 
-            def _send(self, code: int, body, ctype: str = 'application/json; charset=utf-8'):
+            def _send(self, code: int, body, ctype: str = 'application/json; charset=utf-8',
+                      extra_headers: dict = None):
                 data = body if isinstance(body, bytes) else body.encode('utf-8')
                 self.send_response(code)
                 self.send_header('Content-Type', ctype)
                 self.send_header('Content-Length', str(len(data)))
+                for _k, _v in (extra_headers or {}).items():
+                    self.send_header(_k, _v)
                 self.end_headers()
                 try:
                     self.wfile.write(data)
@@ -1170,6 +1593,27 @@ class WebAdmin:
                         n = q.get('lines', ['100'])[0]
                         lv = (q.get('level', [''])[0] or '').strip().upper()
                         self._send(200, ''.join(admin.get_logs(n, lv)), 'text/plain; charset=utf-8')
+                    elif path == '/api/logs/list':
+                        files = admin.list_log_files()
+                        self._send(200, json.dumps(
+                            {'files': files,
+                             'current': (files[0]['name'] if files else ''),
+                             'readonly_note': '列表仅用于下载；页面下方的运行日志始终显示最新的日志文件'},
+                            ensure_ascii=False, indent=2))
+                    elif path == '/api/logs/download':
+                        name = parse_qs(query).get('name', [''])[0]
+                        fname, data = admin.read_log_file(name)
+                        if not fname:
+                            self._send(404, json.dumps(
+                                {'ok': False, 'message': '日志文件不存在或名称不合法'},
+                                ensure_ascii=False))
+                        else:
+                            from urllib.parse import quote
+                            ascii_name = fname.encode('ascii', 'ignore').decode() or 'log.txt'
+                            self._send(200, data, 'text/plain; charset=utf-8',
+                                       {'Content-Disposition':
+                                        "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                                        % (ascii_name, quote(fname))})
                     elif path == '/api/stats':
                         self._send(200, json.dumps(admin.get_stats(), ensure_ascii=False, indent=2))
                     elif path == '/api/plugins':
@@ -1222,6 +1666,52 @@ class WebAdmin:
                         except Exception as e:
                             self._send(500, json.dumps({'ok': False, 'message': str(e)}, ensure_ascii=False))
                         return
+                    if path == '/api/cloud_sync/test':
+                        try:
+                            from core.cloud_sync import test_connection
+                            cs_cfg = (admin.hub.config or {}).get('cloud_sync') or {}
+                            err = test_connection(cs_cfg.get('account_id', ''),
+                                                  cs_cfg.get('database_id', ''),
+                                                  cs_cfg.get('api_token', ''))
+                            self._send(200 if not err else 400,
+                                       json.dumps({'ok': not err,
+                                                   'message': err or '连接成功：令牌与数据库可用，数据表已就绪'},
+                                                  ensure_ascii=False))
+                        except Exception as e:
+                            self._send(500, json.dumps({'ok': False, 'message': str(e)},
+                                                       ensure_ascii=False))
+                        return
+                    if path == '/api/cloud_sync/resume':
+                        try:
+                            cs = getattr(admin.hub, 'cloud_sync', None)
+                            if cs is None:
+                                self._send(400, json.dumps(
+                                    {'ok': False, 'message': '云同步未启用或配置不完整'},
+                                    ensure_ascii=False))
+                                return
+                            cs.resume('手动解除暂停')
+                            self._send(200, json.dumps({'ok': True, 'message': '已解除暂停，'
+                                                                              '下个周期（或立即同步）将继续'},
+                                                       ensure_ascii=False))
+                        except Exception as e:
+                            self._send(500, json.dumps({'ok': False, 'message': str(e)},
+                                                       ensure_ascii=False))
+                        return
+                    if path == '/api/cloud_sync/sync':
+                        try:
+                            cs = getattr(admin.hub, 'cloud_sync', None)
+                            if cs is None:
+                                self._send(400, json.dumps(
+                                    {'ok': False, 'message': '云同步未启用或配置不完整（配置 → 云同步）'},
+                                    ensure_ascii=False))
+                                return
+                            result = cs.sync_once(force=True)   # 手动同步：即使暂停也强制试一次
+                            self._send(200, json.dumps({'ok': True, 'result': result},
+                                                       ensure_ascii=False))
+                        except Exception as e:
+                            self._send(500, json.dumps({'ok': False, 'message': str(e)},
+                                                       ensure_ascii=False))
+                        return
                     if path == '/api/plugins/reload':
                         try:
                             pm = getattr(admin.hub, 'plugin_manager', None)
@@ -1245,6 +1735,17 @@ class WebAdmin:
                                 return
                             if not isinstance(changes, dict):
                                 self._send(400, json.dumps({'ok': False, 'message': 'changes 必须是对象'}, ensure_ascii=False))
+                                return
+                            # 只接受真实存在的插件名（已加载的 + 已禁用未加载的，来自 list_plugins）：
+                            # 避免有人（或误操作）往禁用列表里塞任意名字，让列表无限变大
+                            known = {str(p.get('name')) for p in (pm.list_plugins() or [])}
+                            unknown = [str(n) for n in changes if str(n) not in known]
+                            if unknown:
+                                self._send(400, json.dumps(
+                                    {'ok': False,
+                                     'message': '未知插件名（未在 plugins/ 目录找到）: '
+                                                + '、'.join(unknown[:5])},
+                                    ensure_ascii=False))
                                 return
                             for name, disabled in changes.items():
                                 pm.set_disabled(str(name), bool(disabled))

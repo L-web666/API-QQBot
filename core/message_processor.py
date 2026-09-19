@@ -10,6 +10,9 @@ from typing import Optional, Callable, Dict, Any, List
 from core.logger import mask_transfer_code
 from core.stats import StatsCollector
 
+# 队列满时"繁忙提示"最多同时开几个线程（防止被刷屏时线程数暴涨）
+MAX_BUSY_REPLY_THREADS = 5
+
 
 class MessageProcessor:
     """消息处理器 - 支持排队、分段发送"""
@@ -43,6 +46,8 @@ class MessageProcessor:
         self.rate_limit_interval = max(0.5, float(rl.get('interval_seconds', 3)))
         self._last_reply_at: Dict[str, float] = {}
         self._rate_lock = threading.Lock()
+        # 队列满时的"繁忙提示"并发线程数（防止被刷屏时线程暴涨）
+        self._busy_replies = 0
         
         # 敏感词过滤
         sw = self.config.get('sensitive_words', {}) or {}
@@ -50,6 +55,8 @@ class MessageProcessor:
         self.sensitive_words = [str(w).strip() for w in (sw.get('list') or []) if str(w).strip()]
         self.sensitive_replacement = sw.get('replacement', '***') or '***'
         self.sensitive_block_input = sw.get('block_input', False)
+        # 内置 AI 不可用（没配 API Key）时给用户的兜底回复；留空=不回复，完全交给插件
+        self.no_ai_reply = self.config.get('no_ai_reply', '')
         
         # 有界队列：达到 max_queue_size 后新消息被拒绝（返回繁忙提示），防止无限积压
         self._task_queue = queue.Queue(maxsize=self.max_queue_size)
@@ -82,15 +89,34 @@ class MessageProcessor:
             if self.logger:
                 self.logger.debug(f"消息已入队，当前队列大小: {self._task_queue.qsize()}")
         except queue.Full:
+            # 队列满：在新线程中回复"机器人忙"，避免阻塞WebSocket接收线程。
+            # 但被刷屏时不能每条消息都开一个线程（线程数会瞬间暴涨），所以限制并发数
+            with self._rate_lock:
+                if self._busy_replies >= MAX_BUSY_REPLY_THREADS:
+                    too_many = True
+                else:
+                    too_many = False
+                    self._busy_replies += 1
+            if too_many:
+                if self.logger:
+                    self.logger.warning("队列已满，繁忙提示线程已达上限：本条消息只记日志、不回复")
+                return
             if self.logger:
                 self.logger.warning("队列已满，向用户发送繁忙提示")
-            # 队列满：在新线程中回复"机器人忙"，避免阻塞WebSocket接收线程
-            threading.Thread(target=self._send_busy_reply, args=(message,), daemon=True).start()
+            threading.Thread(target=self._busy_reply_thread, args=(message,), daemon=True).start()
+
+    def _busy_reply_thread(self, message: Dict[str, Any]):
+        """繁忙提示线程入口：无论成功失败都要把并发计数减回去"""
+        try:
+            self._send_busy_reply(message)
+        finally:
+            with self._rate_lock:
+                self._busy_replies = max(0, self._busy_replies - 1)
     
     def _send_busy_reply(self, message: Dict[str, Any]):
         """队列满时向发送者回复繁忙提示"""
-        self.stats.record('busy_replies')
         try:
+            self.stats.record('busy_replies')
             self._send_reply(
                 message.get('type', 'c2c'),
                 message.get('user_openid', ''),
@@ -105,6 +131,18 @@ class MessageProcessor:
                 self.logger.error(f"发送繁忙提示失败: {e}")
 
     # ---------- 回复限速 ----------
+    def _prune_rate_limit(self, now: float):
+        """清理长期没说话的限速记录（调用方需已持有 _rate_lock）
+
+        限速只需要"最近几秒"的信息，但字典按用户/群 key 增长：
+        长期运行（几个月、大量用户）时不清会一直占内存，所以定期把过期的丢掉。
+        """
+        if len(self._last_reply_at) <= 2000:
+            return
+        keep_after = now - max(300.0, self.rate_limit_interval * 20)
+        for k in [k for k, t in self._last_reply_at.items() if t < keep_after]:
+            self._last_reply_at.pop(k, None)
+
     def _rate_limited(self, user_key: str) -> bool:
         """返回 True 表示该用户当前被限速（距上次回复不足间隔）"""
         if not self.rate_limit_enabled or not user_key:
@@ -116,14 +154,17 @@ class MessageProcessor:
                 return True
             # 先占位，避免并发下重复放行
             self._last_reply_at[user_key] = now
+            self._prune_rate_limit(now)
             return False
 
     def _mark_replied(self, user_key: str):
         """AI 实际回复后刷新限速时间（避免限速提示本身也算一次回复）"""
         if not user_key:
             return
+        now = time.time()
         with self._rate_lock:
-            self._last_reply_at[user_key] = time.time()
+            self._last_reply_at[user_key] = now
+            self._prune_rate_limit(now)
 
     # ---------- 敏感词 ----------
     def _contains_sensitive(self, text: str) -> bool:
@@ -302,20 +343,10 @@ class MessageProcessor:
                 if self.logger:
                     self.logger.debug(f"处理了 {len(file_infos)} 个附件")
                 
-                # ====== 新增：语音识别（转文字后拼入消息） ======
-                audio_files = [f for f in file_infos if f.get('type') == 'audio' and f.get('url')]
-                if audio_files:
-                    transcript = self.ai_client.transcribe_audio(audio_files[0]['url'])
-                    if transcript:
-                        content = (content + '\n' + transcript).strip()
-                        message['content'] = content  # 更新，以便上下文存储使用
-                        file_infos = [f for f in file_infos if f.get('type') != 'audio']
-                        if self.logger:
-                            self.logger.info(f"语音已转文字并入消息")
-                    else:
-                        if not content:
-                            content = "请回复这条语音消息。"
-                            message['content'] = content
+                # 语音消息不做识别：无文字时给出占位内容，避免空消息
+                if not content and any(f.get('type') == 'audio' for f in file_infos):
+                    content = "（对方发来一条语音消息）"
+                    message['content'] = content
                 
                 # ====== 改进2：纯图片消息自动补提示 ======
                 if not content:
@@ -345,6 +376,19 @@ class MessageProcessor:
                 return
             
             self.stats.record('ai_calls')
+            
+            # ====== 内置 AI 不可用（未配置 API Key 或已被 ai.enabled 关闭）======
+            # 插件已在上方接管过的消息不会走到这里；这里只处理"没被插件接管"的普通消息。
+            # no_ai_reply 留空 = 保持安静（适合完全由插件接管回复的场景）。
+            if not getattr(self.ai_client, 'usable', True):
+                self.stats.record('ai_errors')
+                if self.logger:
+                    self.logger.warning("内置 AI 不可用（未配置或已由 ai.enabled 关闭），已跳过回答"
+                                        "（可用 no_ai_reply 配置兜底提示，或让插件接管回复）")
+                if self.no_ai_reply:
+                    self._send_reply(msg_type, user_openid, user_name, group_openid,
+                                     channel_id, msg_id, self.no_ai_reply)
+                return
             
             # 使用带文件的多模态调用
             ai_response = self.ai_client.chat_with_files(messages, file_infos)

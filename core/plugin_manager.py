@@ -22,7 +22,13 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+
+
+def _bj_now_str(fmt: str = '%H:%M:%S') -> str:
+    """当前北京时间字符串（不随系统时区变化）"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime(fmt)
 
 
 class PluginBot:
@@ -86,6 +92,16 @@ class PluginManager:
         if self.logger:
             getattr(self.logger, level, print)(msg)
 
+    # ---------- 插件数据目录 ----------
+    def _ensure_plugin_data(self, mod_name: str):
+        """确保插件数据根目录与该插件专属目录存在"""
+        try:
+            root = os.path.join('data', 'plugins_data')
+            os.makedirs(root, exist_ok=True)
+            os.makedirs(os.path.join(root, mod_name), exist_ok=True)
+        except Exception as e:
+            self._log('warning', f"创建插件数据目录失败: {e}")
+
     # ---------- 禁用状态持久化 ----------
     def _load_disabled(self):
         try:
@@ -128,6 +144,15 @@ class PluginManager:
                 elif os.path.isdir(path) and not name.startswith('_') and not name.startswith('.'):
                     entry = self._load_dir(name, path)
                 if entry:
+                    # 同名检测：plugins/ 下不能同时存在 "X.py" 和 "X/"（也防其它重名来源）。
+                    # 后加载的同名插件会被拒绝，避免数据目录(DATA_FILE/DATA_DIR)互相覆盖。
+                    existing = [p for p in self.plugins if p['name'] == entry['name']]
+                    if existing:
+                        self._log('error',
+                                  f"插件名冲突：'{entry['name']}' 已存在（{existing[0]['kind']}），"
+                                  f"跳过 {entry['kind']} 版（{entry['file']}）。请重命名其中一个，"
+                                  f"否则两者数据会写入同一文件互相覆盖。")
+                        continue
                     self.plugins.append(entry)
             disabled_count = len(self.disabled)
             if disabled_count:
@@ -176,6 +201,15 @@ class PluginManager:
                 return None
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
+            # ===== 插件数据存储规范 =====
+            # 所有插件数据统一放 data/plugins_data/ 下。
+            # 注入两个变量给插件使用（在插件代码里直接用 DATA_FILE / DATA_DIR）：
+            #   DATA_FILE = data/plugins_data/<插件名>.json   —— 插件唯一的单文件数据（推荐）
+            #   DATA_DIR  = data/plugins_data/<插件名>/       —— 插件专属文件夹（需多个文件时用）
+            # 规范：插件不得把数据写到 plugins/ 或程序其它位置；互不干扰。
+            self._ensure_plugin_data(mod_name)
+            module.__dict__['DATA_FILE'] = os.path.join('data', 'plugins_data', mod_name + '.json')
+            module.__dict__['DATA_DIR'] = os.path.join('data', 'plugins_data', mod_name)
             spec.loader.exec_module(module)
         except Exception as e:
             self._log('error', f"插件加载失败: {mod_name} - {e}")
@@ -199,7 +233,7 @@ class PluginManager:
             'handle_fn': getattr(module, 'on_message', None),
             'start_fn': getattr(module, 'on_start', None),
             'stop_fn': getattr(module, 'on_stop', None),
-            'loaded_at': time.strftime('%H:%M:%S'),
+            'loaded_at': _bj_now_str(),
         }
         if not entry['handle_fn'] and not entry['start_fn']:
             self._log('error', f"插件缺少 on_message 或 on_start 函数: {mod_name}（已跳过）")
@@ -229,6 +263,14 @@ class PluginManager:
         self.bot = bot
         if bot is not None:
             self._call_start()
+
+    def refresh_bot_config(self, config: dict):
+        """热更新后刷新注入给插件的配置，避免插件读到旧配置（如 ai.enabled / api_key）。
+
+        只替换 config 引用，不重新触发 on_start。
+        """
+        if self.bot is not None and config is not None:
+            self.bot.config = config
 
     def _call_start(self):
         """调用所有插件的 on_start(bot)（启动后台线程/连接外部服务）"""

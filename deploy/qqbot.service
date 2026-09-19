@@ -1,0 +1,35 @@
+[Unit]
+Description=QQ AI Bot (Web admin version)
+Documentation=file:/opt/qqbot/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成实际运行用户（不要用 root）
+User=qqbot
+Group=qqbot
+# 必须是项目根目录：config.json / plugins/ / data/ 都相对工作目录解析
+WorkingDirectory=/opt/qqbot
+
+# ---- Ollama 插件配置（Ollama 跑在 Docker 容器、已把 11434 映射到宿主机）----
+# 机器人也在容器里时，改成本机容器名：http://ollama:11434
+Environment=BOT_OLLAMA_HOST=http://127.0.0.1:11434
+Environment=BOT_OLLAMA_MODEL=qwen3:4b
+Environment=BOT_OLLAMA_THINK=false
+Environment=BOT_OLLAMA_TIMEOUT=600
+Environment=BOT_OLLAMA_HISTORY=6
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+
+ExecStart=/opt/qqbot/.venv/bin/python /opt/qqbot/qqbot.py
+
+Restart=always
+RestartSec=5
+# 程序自带单实例锁（data/bot.lock），重启不会产生重复连接
+
+StandardOutput=append:/opt/qqbot/data/service.log
+StandardError=append:/opt/qqbot/data/service.err.log
+
+[Install]
+WantedBy=multi-user.target

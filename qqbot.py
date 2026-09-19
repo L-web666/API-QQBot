@@ -46,6 +46,9 @@ from core.file_handler import FileHandler
 from core.web_admin import WebAdmin
 from core.stats import StatsCollector
 from core.plugin_manager import PluginManager, PluginBot
+from core.cloud_sync import CloudSync, D1Backend
+from core.deferred_writes import (startup_buffer_activate, startup_buffer_active,
+                                  startup_buffer_flush)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -245,10 +248,16 @@ class QQAIbot:
         # 加载配置
         self.config_manager = ConfigManager()
         self.config = self.config_manager.config
+        self.initialized = False
+        self.ai_available = False   # 内置 AI 是否可用（没配 API Key 也能启动）
+        self.ai_enabled = True      # 内置 AI 总开关（ai.enabled）
+        self._qq_connected = False  # 是否已成功连上 QQ（云同步等它之后再开始）
+        self._cloud_sync_waiting = False
         
         # 初始化日志
         max_log_size = self.config.get('log', {}).get('max_size_mb', 10)
-        self.logger = Logger(max_size_mb=max_log_size)
+        console_color = self.config.get('log', {}).get('console_color', True)
+        self.logger = Logger(max_size_mb=max_log_size, console_color=console_color)
         self.log = self.logger.get_logger()
         
         self.log.info("=" * 60)
@@ -267,23 +276,37 @@ class QQAIbot:
             return
         
         # 检查AI配置（使用简化版）
+        # 注意：内置 AI 属于可选项——没填也能正常启动，
+        # 让「插件接管回复」「关键词回复」「内置指令」这类用法不需要 API Key。
         ai_config = self.config_manager.get_ai_config()
-        if not ai_config.get('api_key') or ai_config.get('api_key') == '请填写你的API密钥':
-            self.log.error("请先在config.json中填写正确的API Key")
-            self.initialized = False
-            return
-        if not ai_config.get('base_url') or ai_config.get('base_url') == '请填写API基础地址（如 https://api.openai.com/v1）':
-            self.log.error("请先在config.json中填写API基础地址")
-            self.initialized = False
-            return
-        if not ai_config.get('model') or ai_config.get('model') == '请填写模型名称（如 gpt-3.5-turbo）':
-            self.log.error("请先在config.json中填写模型名称")
-            self.initialized = False
-            return
-        
-        self.log.info(f"使用AI模型: {ai_config.get('model')}")
+        _placeholder = {
+            'api_key': '请填写你的API密钥',
+            'base_url': '请填写API基础地址（如 https://api.openai.com/v1）',
+            'model': '请填写模型名称（如 gpt-3.5-turbo）',
+        }
+        _missing = [k for k, v in _placeholder.items()
+                    if not ai_config.get(k) or ai_config.get(k) == v]
+        # 内置 AI 总开关（ai.enabled=false：即使填了 Key 也不用内置 AI，回复交给插件）
+        ai_enabled = bool((self.config.get('ai') or {}).get('enabled', True))
+        ai_config = dict(ai_config)
+        ai_config['enabled'] = ai_enabled
+        self.ai_enabled = ai_enabled
+        self.ai_available = ai_enabled and not _missing
+        if not ai_enabled:
+            self.log.warning(
+                "内置 AI 已关闭（ai.enabled=false）——即使 config.json 里填了 API Key 也不会使用，"
+                "普通消息将由插件/关键词回复处理（没被接管的按 no_ai_reply 回复或保持安静）。")
+        elif self.ai_available:
+            self.log.info(f"使用AI模型: {ai_config.get('model')}")
+        else:
+            self.log.warning(
+                "内置 AI 未配置完整（缺少: %s）——程序照常运行，"
+                "插件、关键词回复、内置指令不受影响；"
+                "只有没被插件接管的普通消息无法回答（可用 no_ai_reply 配置兜底提示）。"
+                % '、'.join(_missing))
         
         # 初始化所有模块
+        self._init_cloud_sync()   # 云同步：只做准备，不访问网络（连上 QQ 后再同步，启动更快）
         self._init_modules(qq_config, ai_config)
         self.initialized = True
         
@@ -291,6 +314,134 @@ class QQAIbot:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
+    def _init_cloud_sync(self, start_now: bool = False):
+        """初始化云同步（可选）：只做准备，不访问网络。
+
+        为了让程序启动更快，启动阶段**不做**任何云端请求；
+        真正的首次同步在"成功连接 QQ 之后"由 _start_cloud_sync_after_connect() 触发。
+        在此之前会在控制台提示：刚启动的这段时间数据可能不是最新的。
+        """
+        self.cloud_sync = None
+        self._cloud_sync_waiting = False
+        cs_cfg = (self.config_manager.config or {}).get('cloud_sync', {}) or {}
+        self._cloud_sync_cfg = dict(cs_cfg)
+        if not cs_cfg.get('enabled'):
+            self._apply_startup_buffer(cs_cfg, start_now, sync_ready=False)
+            return
+        try:
+            backend = D1Backend(
+                account_id=cs_cfg.get('account_id', ''),
+                database_id=cs_cfg.get('database_id', ''),
+                api_token=cs_cfg.get('api_token', ''),
+                logger=self.log,
+            )
+            if not backend.configured():
+                self.log.warning("云同步已启用但配置不完整（account_id / database_id / api_token），已跳过")
+                self._apply_startup_buffer(cs_cfg, start_now, sync_ready=False)
+                return
+            self.cloud_sync = CloudSync(
+                backend,
+                logger=self.log,
+                interval=cs_cfg.get('interval_seconds', 60),
+                pull_on_start=cs_cfg.get('pull_on_start', True),
+                upload_logs=cs_cfg.get('upload_logs', False),
+                max_file_mb=cs_cfg.get('max_file_mb', 2),
+                tombstone_days=cs_cfg.get('tombstone_days', 30),
+                apply_remote_deletes=cs_cfg.get('apply_remote_deletes', True),
+                error_pause_minutes=cs_cfg.get('error_pause_minutes', 30),
+            )
+            # 启动写缓存：第一次云同步完成前，data/ 下的改动先缓存在内存里，
+            # 避免"刚启动时写的旧数据/默认值"把云端数据覆盖掉
+            self._apply_startup_buffer(cs_cfg, start_now)
+            if not start_now:
+                # 还没连上 QQ：先提醒用户，别以为数据已经是最新的
+                self._cloud_sync_waiting = True
+                self.log.warning(
+                    "云同步尚未执行：刚启动的这段时间本地数据可能不是最新的"
+                    "（其它服务器上的改动/删除还没拉取，请稍等片刻，"
+                    "成功连接 QQ 后会立即自动同步一次）。")
+                return
+            self._start_cloud_sync_thread()
+        except Exception as e:
+            self.log.warning(f"云同步初始化失败（不影响程序运行）: {e}")
+            self.cloud_sync = None
+
+    def _apply_startup_buffer(self, cs_cfg: Dict[str, Any], start_now: bool,
+                              sync_ready: bool = True):
+        """启动写缓存的总开关（没启用云同步时完全不生效，也不会有任何云同步相关提示）
+
+        · 启用了云同步 + 还没连上 QQ（首次同步没完成）→ 开启缓存
+        · 已经连上并立即同步 / 缓存已在运行 → 不用重复开
+        · 关闭了云同步（或配置不完整）而缓存还开着 → 立刻落盘，避免数据一直不写
+        """
+        want = bool(sync_ready and cs_cfg.get('enabled') and cs_cfg.get('startup_buffer', True))
+        if not want:
+            if startup_buffer_active():
+                startup_buffer_flush('云同步已关闭（启动写缓存不再需要）',
+                                     warning=True, logger=self.log)
+            return
+        if start_now or startup_buffer_active():
+            return
+        minutes = cs_cfg.get('startup_buffer_minutes', 3)
+        try:
+            limit = float(minutes) * 60.0
+        except (TypeError, ValueError):
+            limit = 180.0
+        try:
+            max_mb = float(cs_cfg.get('startup_buffer_max_mb', 8))
+        except (TypeError, ValueError):
+            max_mb = 8.0
+        startup_buffer_activate(
+            root='data', logger=self.log, limit_seconds=limit, max_mb=max_mb,
+            keep_remote=bool(cs_cfg.get('startup_buffer_keep_remote', True)))
+
+    def _start_cloud_sync_thread(self):
+        """真正启动云同步线程（连接 QQ 成功后调用）：若配置了 pull_on_start 则立即拉取一次"""
+        if getattr(self, 'cloud_sync', None) is None:
+            return
+        cs_cfg = getattr(self, '_cloud_sync_cfg', {}) or {}
+        immediate = bool(cs_cfg.get('pull_on_start', True))
+        try:
+            if immediate:
+                self.log.info("已连接 QQ：立即执行首次云同步（拉取云端数据并上传本地改动）…")
+            self.cloud_sync.start(immediate=immediate)
+            self._cloud_sync_waiting = False
+        except Exception as e:
+            self.log.warning(f"云同步线程启动失败: {e}")
+
+    def _start_cloud_sync_after_connect(self):
+        """连接 QQ 成功后调用：开始云同步（在此之前不同步）"""
+        self._qq_connected = True
+        if getattr(self, 'cloud_sync', None) is not None:
+            self._start_cloud_sync_thread()
+        elif getattr(self, '_cloud_sync_waiting', False):
+            self.log.warning("云同步仍未启动（配置不完整），本次运行不会同步数据")
+
+    def _restart_cloud_sync(self):
+        """按最新配置重启云同步（热更新用）：改开关 / 写入间隔 / 凭据都无需重启程序。
+
+        若程序还没连上 QQ，就只做准备（不启动线程），等连接成功后再开始同步。
+        """
+        # 保留累计统计：热更新重建实例后，退出时的汇总不会归零
+        old_totals = dict(getattr(getattr(self, 'cloud_sync', None), '_totals', {}) or {})
+        try:
+            if getattr(self, 'cloud_sync', None) is not None:
+                self.cloud_sync.stop(final_sync=True)
+        except Exception as e:
+            self.log.warning(f"停止云同步失败: {e}")
+        self.cloud_sync = None
+        connected = bool(getattr(self, '_qq_connected', False))
+        self._init_cloud_sync(start_now=connected)
+        if getattr(self, 'cloud_sync', None) is not None:
+            for k, v in old_totals.items():
+                self.cloud_sync._totals[k] = self.cloud_sync._totals.get(k, 0) + int(v or 0)
+            if connected:
+                self.log.info(f"云同步已按新配置启用（每 {self.cloud_sync.interval} 秒写入一次）")
+            else:
+                self.log.info("云同步配置已更新；等连接 QQ 成功后开始同步")
+        else:
+            self.log.info("云同步已关闭（配置 cloud_sync.enabled=false 或凭据不完整）")
+
     def _init_modules(self, qq_config: Dict[str, Any], ai_config: Dict[str, Any]):
         """初始化所有模块"""
         # QQ客户端
@@ -342,6 +493,7 @@ class QQAIbot:
             'admin_openids': self.config.get('admin', {}).get('openids', []),
             'rate_limit': self.config.get('rate_limit', {}),
             'sensitive_words': self.config.get('sensitive_words', {}),
+            'no_ai_reply': self.config.get('no_ai_reply', ''),
         }
         
         # 消息处理器
@@ -413,6 +565,13 @@ class QQAIbot:
         self.log.info("启动消息处理器...")
         self.message_processor.start()
         
+        # 启动云同步后台线程（可选）
+        if getattr(self, 'cloud_sync', None) is not None:
+            try:
+                self.cloud_sync.start()
+            except Exception as e:
+                self.log.warning(f"云同步线程启动失败: {e}")
+        
         # 启动配置热更新监视线程
         if self._hot_reload_enabled:
             self._config_watcher_running = True
@@ -449,15 +608,18 @@ class QQAIbot:
         
         self.log.info("连接QQ服务器...")
         success = self.qq_client.connect()
-        
         if not success:
             self.log.error("连接QQ服务器失败")
             self._send_alert("机器人连接QQ服务器失败，请检查网络或凭据。")
             self.stop()
             return
-        
+
+        # 连接成功后才开始云同步（启动阶段不做网络请求，让程序起得更快；
+        # 在此之前控制台已提示"数据可能不是最新的"）
+        self._start_cloud_sync_after_connect()
+
         self.log.info("QQ AI Bot 运行中...")
-    
+
     def stop(self):
         """停止程序"""
         self.log.info("正在停止...")
@@ -473,6 +635,17 @@ class QQAIbot:
         if self._web_admin:
             self._web_admin.stop()
             self._web_admin = None
+        if getattr(self, 'cloud_sync', None) is not None:
+            try:
+                self.cloud_sync.stop(final_sync=True)   # 退出前做最后一次同步，避免丢最新数据
+            except Exception as e:
+                self.log.warning(f"云同步停止时出错: {e}")
+        # 兜底：启动写缓存里还有没落盘的改动（首次同步一直没成功）→ 写回磁盘，绝不丢数据
+        try:
+            if startup_buffer_active():
+                startup_buffer_flush('程序退出（第一次云同步未完成）', warning=True)
+        except Exception as e:
+            self.log.warning(f"写回启动缓存时出错: {e}")
         if hasattr(self, 'message_processor'):
             self.message_processor.stop()
         if hasattr(self, 'qq_client'):
@@ -494,25 +667,50 @@ class QQAIbot:
             try:
                 mtime = self._get_config_mtime()
                 if mtime != self._last_config_mtime:
-                    self._last_config_mtime = mtime
-                    self._apply_hot_config()
+                    self._apply_hot_config(source='文件监视')
             except Exception as e:
                 self.log.error(f"配置热更新检查异常: {e}")
     
-    def _apply_hot_config(self):
-        """把 config.json 中的可热更新项应用到运行中的组件"""
+    def _apply_hot_config(self, source: str = ''):
+        """把 config.json 中的可热更新项应用到运行中的组件
+
+        source: 触发来源（'文件监视' / 'Web后台'），只用于日志区分，便于排查重复热更新。
+        结束时会把 config.json 的 mtime 记为"已消费"，避免同一次修改被重复应用。
+        """
         self.config_manager.reload()
         cfg = self.config_manager.config
         changed = []
         
-        # AI 客户端（api_key / base_url / model）
+        # AI 客户端（api_key / base_url / model + ai.enabled 总开关）
         ai = self.config_manager.get_ai_config()
-        if ai != self.ai_client.config:
+        ai_enabled = bool((cfg.get('ai') or {}).get('enabled', True))
+        was_usable = getattr(self.ai_client, 'usable', False)
+        # 只比较 3 个 AI 字段（ai_client.config 里还可能有 enabled 等附加键，
+        # 直接整体比较会导致每次热更新都误报“AI配置已变化”）
+        cur_ai = {k: (getattr(self.ai_client, k, '') or '') for k in ('api_key', 'base_url', 'model')}
+        if ai != cur_ai:
             self.ai_client.config = ai
             self.ai_client.api_key = ai.get('api_key', '')
             self.ai_client.base_url = ai.get('base_url', '')
             self.ai_client.model = ai.get('model', 'gpt-3.5-turbo')
             changed.append('AI配置')
+        # 总开关与可用性在热更新时都要重算（补填 Key / 开关 ai.enabled 都无需重启）
+        if ai_enabled != getattr(self.ai_client, 'enabled', True):
+            self.ai_client.enabled = ai_enabled
+            changed.append('AI开关')
+        self.ai_enabled = ai_enabled
+        self.ai_client.available = bool(self.ai_client.api_key
+                                        and self.ai_client.base_url
+                                        and self.ai_client.model)
+        self.ai_available = self.ai_client.usable
+        self.ai_client._warned = False
+        if self.ai_client.usable != was_usable:
+            if self.ai_client.usable:
+                self.log.info(f"内置 AI 已启用（热更新）: {self.ai_client.model}")
+            elif not ai_enabled:
+                self.log.warning("内置 AI 已关闭（ai.enabled=false，热更新）：回复交给插件/关键词")
+            else:
+                self.log.warning("内置 AI 已停用（配置被清空，热更新）")
         
         # 消息处理器
         mp = self.message_processor
@@ -611,8 +809,40 @@ class QQAIbot:
                 mp.sensitive_replacement = sw.get('replacement', '***') or '***'
                 mp.sensitive_block_input = sw.get('block_input', False)
                 changed.append('sensitive_words')
+            # no_ai_reply 也要热更新（兜底回复文案）
+            nar = cfg.get('no_ai_reply', '')
+            if nar != getattr(mp, 'no_ai_reply', ''):
+                mp.no_ai_reply = nar
+                changed.append('no_ai_reply')
+
+        # 云同步（热更新：改开关 / 写入间隔 / 凭据都不用重启）
+        new_cs = dict(cfg.get('cloud_sync') or {})
+        if new_cs != getattr(self, '_cloud_sync_cfg', None):
+            self._restart_cloud_sync()
+            changed.append('云同步')
+
+        # 插件看到的是同一份配置对象：刷新引用，避免插件读到旧配置
+        # （例如插件要判断主程序内置 AI 是否可用 / ai.enabled 是否打开）
+        self.config = cfg          # 让其它读取 self.config 的地方也拿到最新配置
+        try:
+            if getattr(self, 'plugin_manager', None) is not None:
+                self.plugin_manager.refresh_bot_config(cfg)
+        except Exception as e:
+            self.log.warning(f"刷新插件配置失败: {e}")
         
-        self.log.info(f"配置已热更新: {', '.join(changed) if changed else '无变化'}")
+        # 把当前 mtime 记为"已消费"：避免同一次修改被监视线程再应用一遍（重复触发）
+        try:
+            self._last_config_mtime = self._get_config_mtime()
+        except Exception:
+            pass
+
+        if changed:
+            where = f"（来源：{source}）" if source else ''
+            self.log.info(f"配置已热更新{where}: {', '.join(changed)}")
+        else:
+            # 没有实际变化：只写日志文件（DEBUG），控制台不再出现"无变化"
+            where = f"（来源：{source}）" if source else ''
+            self.log.debug(f"配置热更新检查：内容无变化，已忽略{where}")
         return changed
     
     # ---------- 指令面板 ----------
@@ -677,6 +907,8 @@ class QQAIbot:
                     if ok:
                         if self.logger:
                             self.logger.info(f"指令面板更新成功({scope})")
+                        # specific 面板必须单独关联用户/群（更新内容不会建立关联）
+                        self._ensure_panel_targets(panel_id, scope, target_type, openids)
                         continue
                     # 更新失败：本地缓存的面板可能已被删除/失效，清除缓存并尝试创建
                     if self.logger:
@@ -689,12 +921,32 @@ class QQAIbot:
                     self._save_panel_ids(panel_ids)
                     if self.logger:
                         self.logger.info(f"指令面板创建成功({scope}) panel_id={panel_id}")
+                    self._ensure_panel_targets(panel_id, scope, target_type, openids)
                 elif self.logger:
                     self.logger.error(f"指令面板创建失败({scope})；若提示\"超出数量限制\"，"
                                       f"请到 Web 管理面板『指令面板管理』删除旧面板后点「重新注册面板」重试")
         except Exception as e:
             if self.logger:
                 self.logger.error(f"指令面板注册异常: {e}")
+
+    def _ensure_panel_targets(self, panel_id: str, scope: str,
+                              target_type: str, openids: list):
+        """确保 specific 面板的关联用户/群已建立。
+
+        官方要求：关联对象通过「修改指令面板关联对象」接口单独增删（add 幂等），
+        更新面板内容接口不会建立关联。target_type=specific 且有 openids 时每次注册都补 add。
+        """
+        if target_type != 'specific':
+            return
+        if not openids:
+            if self.logger:
+                self.logger.warning(f"面板({scope})为 specific 但未配置关联对象，聊天界面不会展示")
+            return
+        try:
+            self.qq_client.set_panel_targets(panel_id, scope, openids, op='add')
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"关联面板对象异常({scope}): {e}")
     
     # ---------- 错误告警 ----------
     def _send_alert(self, text: str):
