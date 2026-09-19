@@ -8,6 +8,9 @@
 
 当前版本：**v1.4.0**（变更见 [CHANGELOG.md](CHANGELOG.md)，流程图见 [docs/](docs/)）
 
+**如果你是从**`QQ-Bot`**这个项目中迁移过来的，请启用该仓库内的**`plugins/ollama.py`**插件**  
+详细操作方法请见该项目目录中的`date/plugins_date/ollama/ollama配置说明.txt`
+
 ---
 
 ## ✨ 功能特性
@@ -178,7 +181,7 @@
 ```
 API_qqbot/
 ├── qqbot.py                  # 主程序入口（多模块版）
-├── config.json               # 配置文件（运行时生成/填写，已被 .gitignore 排除）
+├── config.json               # 配置文件（运行时生成/填写）
 ├── config配置说明文件.txt      # 自动生成的配置说明（中文）
 ├── start.bat / start.sh      # 启动脚本（崩溃自动重启）
 ├── core/
@@ -224,7 +227,7 @@ python -m PyInstaller --noconfirm --clean --name QQAIbot --onedir qqbot_single.p
 
 ## ⚠️ 安全提示
 
-- `config.json` 包含 AppSecret 与 API Key，**已被 `.gitignore` 排除，请勿提交到公开仓库**
+- `config.json` 包含 AppSecret 与 API Key，**请勿提交到公开仓库**
 - `web_admin.token` 留空 = 面板不校验；只要 `host` 不是 `127.0.0.1`，就一定要设置令牌
 - 云同步的 `api_token` 建议只给「D1 → 编辑」权限，不要用全局 API Key
 - 插件代码会被直接执行，只放你信任的文件
