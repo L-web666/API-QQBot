@@ -178,7 +178,6 @@
 ```
 API_qqbot/
 ├── qqbot.py                  # 主程序入口（多模块版）
-├── qqbot_single.py           # 单文件整合版（可独立运行/打包 exe）
 ├── config.json               # 配置文件（运行时生成/填写，已被 .gitignore 排除）
 ├── config配置说明文件.txt      # 自动生成的配置说明（中文）
 ├── start.bat / start.sh      # 启动脚本（崩溃自动重启）
